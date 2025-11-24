@@ -568,11 +568,14 @@ class IndexTTS2:
 
             # 加载和处理情感音频
             emo_audio, _ = self._load_and_cut_audio(emo_audio_prompt,15,verbose,sr=16000)
+            # print(f"[DEBUG] emo_audio shape:{emo_audio.shape}")  # torch.Size([1, 46289])
             emo_inputs = self.extract_features(emo_audio, sampling_rate=16000, return_tensors="pt")
             emo_input_features = emo_inputs["input_features"]
             emo_attention_mask = emo_inputs["attention_mask"]
             emo_input_features = emo_input_features.to(self.device)
             emo_attention_mask = emo_attention_mask.to(self.device)
+            # print(f"[DEBUG] emo_attention_mask: {emo_attention_mask.shape}")  # torch.Size([1, 144])
+            # print(f"[DEBUG] emo_input_features: {emo_input_features.shape}")  # torch.Size([1, 144, 160])
             emo_cond_emb = self.get_emb(emo_input_features, emo_attention_mask)
 
             # 更新情感条件缓存
