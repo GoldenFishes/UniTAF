@@ -589,14 +589,25 @@ if __name__ == "__main__":
 
 
     # 不使用批量实验，单独测试
-    text = "酒楼丧尽天良，开始借机竞拍房间，哎，一群蠢货。"
+    # text = "酒楼丧尽天良，开始借机竞拍房间，哎，一群蠢货。"
+    # experiment.tts.infer(
+    #     spk_audio_prompt='examples/voice_07.wav',
+    #     text=text,
+    #     output_path="gen.wav",
+    #     emo_audio_prompt="examples/emo_sad.wav",
+    #     # 当指定情感参考音频文件时，你可以选择设置 emo_alpha 来调整对输出的影响程度。
+    #     emo_alpha=0.9,  # 有效范围为 0.0 - 1.0，默认值为 1.0
+    #     verbose=True
+    # )
+
+    text = "快躲起来！是他要来了！他要来抓我们了！"
     experiment.tts.infer(
-        spk_audio_prompt='examples/voice_07.wav',
+        spk_audio_prompt='examples/voice_12.wav',
         text=text,
         output_path="gen.wav",
-        emo_audio_prompt="examples/emo_sad.wav",
-        # 当指定情感参考音频文件时，你可以选择设置 emo_alpha 来调整对输出的影响程度。
-        emo_alpha=0.9,  # 有效范围为 0.0 - 1.0，默认值为 1.0
+        emo_alpha=0.6,
+        use_emo_text=True,  # 根据提供的文字脚本引导情绪
+        use_random=False,
         verbose=True
     )
 

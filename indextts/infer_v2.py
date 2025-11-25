@@ -577,6 +577,7 @@ class IndexTTS2:
             # print(f"[DEBUG] emo_attention_mask: {emo_attention_mask.shape}")  # torch.Size([1, 144])
             # print(f"[DEBUG] emo_input_features: {emo_input_features.shape}")  # torch.Size([1, 144, 160])
             emo_cond_emb = self.get_emb(emo_input_features, emo_attention_mask)
+            # print(F"[DEBUG] emo_cond_emb {emo_cond_emb.shape}")  # torch.Size([1, 144, 1024])
 
             # 更新情感条件缓存
             self.cache_emo_cond = emo_cond_emb
@@ -652,11 +653,13 @@ class IndexTTS2:
                         torch.tensor([emo_cond_emb.shape[-1]], device=text_tokens.device),
                         alpha=emo_alpha
                     )
+                    # print(f"[DEBUG] emovec.shape: {emovec.shape}")  # torch.Size([1, 1280])
 
                     # 如果提供了情感向量，进行混合
                     if emo_vector is not None:
                         emovec = emovec_mat + (1 - torch.sum(weight_vector)) * emovec
                         # emovec = emovec_mat
+                        # print(f"[DEBUG] 混合后emovec: {emovec.shape}")  # torch.Size([1, 1280])
 
                     # 语音推理生成语义编码
                     codes, speech_conditioning_latent = self.gpt.inference_speech(
