@@ -485,20 +485,31 @@ class UnifiedVoice(nn.Module):
         # self.inference_model = PrunedGPT2InferenceModel(gpt_config, self.gpt, self.mel_pos_embedding, self.mel_embedding, self.final_norm, self.mel_head)
         self.gpt.wte = self.mel_embedding
 
+
     def build_aligned_inputs_and_targets(self, input, start_token, stop_token):
-        inp = F.pad(input, (1, 0), value=start_token)
-        tar = F.pad(input, (0, 1), value=stop_token)
+        """
+        假设原始音频token序列为 [t1, t2, t3]
+
+        输入序列 (inp): [start, t1, t2, t3]
+        目标序列 (tar): [t1, t2, t3, stop]
+        """
+
+        inp = F.pad(input, (1, 0), value=start_token)  # 在开头添加start_token
+        tar = F.pad(input, (0, 1), value=stop_token)   # 在末尾添加stop_token
         return inp, tar
 
     def set_mel_padding(self, mel_input_tokens, mel_lengths):
         """
+        给定从填充音频片段派生的mel tokens和实际每个batch元素的音频长度，
+        用STOP_MEL_TOKEN替换零填充。这是创建可工作TTS模型所需的预格式化
+        /
         Given mel tokens that are derived from a padded audio clip and the actual lengths of each batch element in
         that audio clip, reformats the tokens with STOP_MEL_TOKEN in place of the zero padding. This is required
         preformatting to create a working TTS model.
         """
         for b in range(len(mel_lengths)):
-            # Due to the convolutional nature of how these tokens are generated,
-            # it would be best if the model predicts a token past the actual last token.
+            # 由于这些token生成的卷积性质， / Due to the convolutional nature of how these tokens are generated,
+            # 最好让模型预测实际最后一个token之后的一个token。 / it would be best if the model predicts a token past the actual last token.
             actual_end = mel_lengths[b]
             if actual_end < mel_input_tokens.shape[-1]:
                 mel_input_tokens[b, actual_end:] = self.stop_mel_token
@@ -519,62 +530,96 @@ class UnifiedVoice(nn.Module):
         return text_input_tokens
 
     def get_logits(self, speech_conditioning_inputs, first_inputs, first_head, second_inputs=None, second_head=None, get_attns=False, return_latent=False):
+        # 拼接所有输入：参考音频条件 + 文本输入 + 音频输入（如果存在）
         if second_inputs is not None:
             emb = torch.cat([speech_conditioning_inputs, first_inputs, second_inputs], dim=1)
         else:
             emb = torch.cat([speech_conditioning_inputs, first_inputs], dim=1)
 
+        # 核心前向过程：将拼接后的embedding输入到GPT/Transformer中
         gpt_out = self.gpt(inputs_embeds=emb, return_dict=True, output_attentions=get_attns)
         if get_attns:
             return gpt_out.attentions
 
+        # 计算偏移量，跳过参考音频条件部分（只取文本和音频的输出）
         offset = speech_conditioning_inputs.shape[1]
-        enc = gpt_out.last_hidden_state[:, offset:]
-        enc = self.final_norm(enc)
+        enc = gpt_out.last_hidden_state[:, offset:]  # 去掉条件部分，只保留文本和音频的隐藏状态
+        enc = self.final_norm(enc)  # 应用层归一化
 
         if return_latent:
             return enc[:, :first_inputs.shape[1]], enc[:, -second_inputs.shape[1]:]
 
+        # 分割输出：文本部分的logits
         first_logits = enc[:, :first_inputs.shape[1]]
-        first_logits = first_head(first_logits)
-        first_logits = first_logits.permute(0, 2, 1)
+        first_logits = first_head(first_logits)  # 文本head投影到文本词表
+        first_logits = first_logits.permute(0, 2, 1)  # 调整维度用于cross_entropy
         if second_inputs is not None:
+            # 分割输出：音频部分的logits
             second_logits = enc[:, -second_inputs.shape[1]:]
-            second_logits = second_head(second_logits)
-            second_logits = second_logits.permute(0, 2, 1)
+            second_logits = second_head(second_logits)  # 音频head投影到音频token词表
+            second_logits = second_logits.permute(0, 2, 1)  # 调整维度用于cross_entropy  # (batch_size, sequence_length, audio_vocab_size)
             return first_logits, second_logits
         else:
             return first_logits
 
     def get_conditioning(self, speech_conditioning_input, cond_mel_lengths=None):
+        """
+        获取语音条件特征
+        Args:
+            speech_conditioning_input: 语音条件输入，形状通常为 (B, D, T) 或 (B, 1, D, T)
+            cond_mel_lengths: 条件mel长度，用于掩码处理
+        Returns:
+            conds: 条件特征，形状通常为 (B, 32, D) 或 (B, 1, D)
+        """
+
+        # 1. Perceiver编码器条件提取方式
         if self.condition_type == "perceiver":
+            # 如果输入是4维，去除多余的维度
             if speech_conditioning_input.ndim == 4:
                 speech_conditioning_input = speech_conditioning_input.squeeze(1)
-            speech_conditioning_input = self.conditioning_encoder(speech_conditioning_input)  # (b, d, s)
-            conds = self.perceiver_encoder(speech_conditioning_input.transpose(1, 2))  # (b, 32, d)
+            # 先通过条件编码器处理: (B, D, S) -> (B, D, S)
+            speech_conditioning_input = self.conditioning_encoder(speech_conditioning_input)
+            # 再通过Perceiver编码器: (B, S, D) -> (B, 32, D) 输出固定32个token
+            conds = self.perceiver_encoder(speech_conditioning_input.transpose(1, 2))
+
+        # 2. Conformer + Perceiver编码器条件提取方式
         elif self.condition_type == "conformer_perceiver":
-            speech_conditioning_input, mask = self.conditioning_encoder(speech_conditioning_input.transpose(1, 2),
-                                                                        cond_mel_lengths)  # (b, s, d), (b, 1, s)
-            if self.condition_type == "conformer_perceiver":
-                # conds_mask = torch.cat([torch.ones((mask.shape[0], self.cond_num), dtype=torch.bool), mask.squeeze(1)], dim=1)
-                conds_mask = self.cond_mask_pad(mask.squeeze(1))
-                conds = self.perceiver_encoder(speech_conditioning_input, conds_mask)  # (b, 32, d)
+            # 通过Conformer条件编码器处理，同时返回掩码: (B, S, D), (B, 1, S)
+            speech_conditioning_input, mask = self.conditioning_encoder(
+                speech_conditioning_input.transpose(1, 2), cond_mel_lengths
+            )
+            # 为条件特征生成掩码
+            conds_mask = self.cond_mask_pad(mask.squeeze(1))
+            # 使用带掩码的Perceiver编码器: (B, S, D) -> (B, 32, D)
+            conds = self.perceiver_encoder(speech_conditioning_input, conds_mask)
+
+        # 3. GST（全局风格token）条件提取方式
         elif self.condition_type == "gst":
+            # 如果输入是4维，去除多余的维度
             if speech_conditioning_input.ndim == 4:
                 speech_conditioning_input = speech_conditioning_input.squeeze(1)
-            conds = self.gst_encoder(speech_conditioning_input.transpose(1, 2))  # (b, 1, d)
+            # 通过GST编码器提取全局风格特征: (B, S, D) -> (B, 1, D)
+            conds = self.gst_encoder(speech_conditioning_input.transpose(1, 2))
+
+        # 4. 默认条件提取方式（平均池化）
         else:
+            # 确保输入是4维的: (B, 1, D, T)
             speech_conditioning_input = (
                 speech_conditioning_input.unsqueeze(1)
                 if len(speech_conditioning_input.shape) == 3
                 else speech_conditioning_input
             )
             conds = []
+            # 对每个通道分别提取条件特征
             for j in range(speech_conditioning_input.shape[1]):
                 conds.append(self.conditioning_encoder(speech_conditioning_input[:, j]))
+            # 堆叠所有通道的条件特征
             conds = torch.stack(conds, dim=1)
+            # 对所有通道求平均，得到全局条件特征
             conds = conds.mean(dim=1)
+            # 添加序列维度: (B, D) -> (B, 1, D)
             conds = conds.unsqueeze(1)
+
         return conds
 
 
@@ -589,46 +634,63 @@ class UnifiedVoice(nn.Module):
     def forward(self, speech_conditioning_latent, text_inputs, text_lengths, mel_codes, mel_codes_lengths, emo_speech_conditioning_latent,
                 cond_mel_lengths=None, emo_cond_mel_lengths=None, emo_vec=None, use_speed=None, do_spk_cond=False):
         """
-        Forward pass that uses both text and voice in either text conditioning mode or voice conditioning mode
+        前向传播，同时使用文本和语音条件，可在文本条件模式或语音条件模式下工作
 
-        speech_conditioning_input: MEL float tensor, (b,1024)
-        text_inputs: long tensor, (b,t)
-        text_lengths: long tensor, (b,)
-        mel_inputs:  long tensor, (b,m)
-        wav_lengths: long tensor, (b,)
+        speech_conditioning_input: MEL浮点张量, (batch,1024)
+        text_inputs: 长整型张量, (batch, text长度)
+        text_lengths: 长整型张量, (batch,)
+        mel_inputs: 长整型张量, (batch, mel长度)
+        wav_lengths: 长整型张量, (batch,)
 
-        If return_attentions is specified, only logits are returned.
-        If return_latent is specified, loss & logits are not computed or returned. Only the predicted latents are returned.
+        如果指定return_attentions，只返回logits。
+        如果指定return_latent，不计算或返回loss和logits，只返回预测的潜在表示。
         """
-
+        # 处理说话人条件特征
         if do_spk_cond:
+            # 如果需要重新计算说话人条件，通过条件编码器获取
             speech_conditioning_latent = self.get_conditioning(speech_conditioning_latent.transpose(1,2), cond_mel_lengths)
         else:
+            # 否则直接使用传入的说话人条件特征
             speech_conditioning_latent = speech_conditioning_latent
 
+        # 处理情感向量
         if emo_vec is None:
+            # 从情感语音条件计算情感向量
             emo_vec_syn_ori = self.get_emo_conditioning(emo_speech_conditioning_latent.transpose(1,2), emo_cond_mel_lengths)
-            emo_vec_syn = self.emovec_layer(emo_vec_syn_ori)
-            emo_vec = self.emo_layer(emo_vec_syn)
+            emo_vec_syn = self.emovec_layer(emo_vec_syn_ori)  # 情感向量层处理
+            emo_vec = self.emo_layer(emo_vec_syn)            # 情感层处理
 
-        text_inputs = self.set_text_padding(text_inputs, text_lengths)
-        text_inputs = F.pad(text_inputs, (0, 1), value=self.stop_text_token)
+        # 文本输入处理
+        text_inputs = self.set_text_padding(text_inputs, text_lengths)  # 设置文本填充
+        text_inputs = F.pad(text_inputs, (0, 1), value=self.stop_text_token)  # 在末尾添加停止文本token
 
-        mel_codes = self.set_mel_padding(mel_codes, mel_codes_lengths)
-        mel_codes = F.pad(mel_codes, (0, 1), value=self.stop_mel_token)
+        # mel编码处理
+        mel_codes = self.set_mel_padding(mel_codes, mel_codes_lengths)  # 设置mel填充
+        mel_codes = F.pad(mel_codes, (0, 1), value=self.stop_mel_token)  # 在末尾添加停止mel token
 
-        duration_emb = self.speed_emb(torch.zeros_like(use_speed))
-        duration_emb_half = self.speed_emb(torch.ones_like(use_speed))
+        # 速度控制嵌入
+        duration_emb = self.speed_emb(torch.zeros_like(use_speed))        # 正常速度嵌入
+        duration_emb_half = self.speed_emb(torch.ones_like(use_speed))    # 半速嵌入
+
+        # 合并所有条件特征：说话人条件 + 情感向量 + 速度控制
         conds = torch.cat((speech_conditioning_latent + emo_vec.unsqueeze(1), duration_emb_half.unsqueeze(1), duration_emb.unsqueeze(1)), 1)
+
+        # 构建文本的输入和目标对齐
         text_inputs, text_targets = self.build_aligned_inputs_and_targets(text_inputs, self.start_text_token, self.stop_text_token)
+        # 文本嵌入 = 词嵌入 + 位置嵌入
         text_emb = self.text_embedding(text_inputs) + self.text_pos_embedding(text_inputs)
+
+        # 构建mel编码的输入和目标对齐
         mel_codes, mel_targets = self.build_aligned_inputs_and_targets(mel_codes, self.start_mel_token, self.stop_mel_token)
 
+        # mel嵌入 = mel词嵌入 + mel位置嵌入
         mel_emb = self.mel_embedding(mel_codes)
         mel_emb = mel_emb + self.mel_pos_embedding(mel_codes)
 
+        # 获取文本和mel的logits（实际上是潜在表示）
         text_logits, mel_logits = self.get_logits(conds, text_emb, self.text_head, mel_emb, self.mel_head, get_attns=False, return_latent=True)
-        return mel_logits[:, :-2]  # Despite the name, these are not logits. Strip off the two tokens added by this forward pass.
+        # 返回mel的logits，去掉前向传播中添加的两个token
+        return mel_logits[:, :-2]  # 尽管名字叫logits，但这些不是真正的logits / Despite the name, these are not logits. Strip off the two tokens added by this forward pass.
 
     def prepare_gpt_inputs(
         self,
@@ -637,53 +699,79 @@ class UnifiedVoice(nn.Module):
     ):
         
         """
-        Prepare the inputs for the GPT2InferenceModel to generate.
+        为GPT2推理模型准备输入
         Args:
-            conds_latent: (b, 32, dim) audio conditioning embedding by `get_conditioning()`
-            text_inputs: (b, L)
+            conditional_latents: (b, 32, dim) 通过get_conditioning()得到的音频条件嵌入
+            text_inputs: (b, L) 文本输入token
         Returns:
-            input_ids: (b, s+1) the input ids for the GPT2InferenceModel.generate()
-            inputs_embeds: (b, s+1, dim) the input embeddings for the GPT2InferenceModel.forward()
-            attention_mask: (b, s+1) the attention mask for the GPT2InferenceModel.generate()
+            input_ids: (b, s+1) 用于GPT2InferenceModel.generate()的输入ID
+            inputs_embeds: (b, s+1, dim) 用于GPT2InferenceModel.forward()的输入嵌入
+            attention_mask: (b, s+1) 用于GPT2InferenceModel.generate()的注意力掩码
         """
+        # 获取批次大小和文本序列长度
         b, L = text_inputs.shape[:2]
         device = text_inputs.device
+
+        # 检查是否为单一样本的条件（适用于所有文本使用相同语音条件的情况）
         single_cond = conditional_latents.ndim == 3 and conditional_latents.shape[0] == 1
+        # 如果不是单一样本条件，确保条件与文本批次大小匹配
         if not single_cond:
             assert conditional_latents.shape[0] == b, f"batch size mismatch: {conditional_latents.shape[0]} vs {b}"
-        batched_mel_emb = []
-        attention_masks = []
+
+        # 初始化存储列表
+        batched_mel_emb = []      # 存储每个样本的mel嵌入
+        attention_masks = []      # 存储每个样本的注意力掩码
+
+        # 计算目标长度：条件token数 + 文本token数 + 2（起始和结束文本token）
         target_len = conditional_latents.shape[1] + L + 2
+
+        # 对批次中的每个样本分别处理
         for i in range(b):
+            # 创建有效掩码，过滤掉起始和结束文本token
             valid_mask = (text_inputs[i] != self.stop_text_token) & (text_inputs[i] != self.start_text_token)
+
+            # 应用掩码，获取有效的文本输入
             text_input = text_inputs[i][valid_mask]
+            # 在文本开头添加起始文本token
             text_input = F.pad(text_input, (1, 0), value=self.start_text_token)
+            # 在文本末尾添加结束文本token
             text_input = F.pad(text_input, (0, 1), value=self.stop_text_token)
+
+            # 创建文本位置编码
             text_input_pos = torch.arange(0, text_input.size(-1), device=device)
             text_emb = self.text_embedding(text_input) + self.text_pos_embedding.emb(text_input_pos)
-            # concatenate [conditional latents][text embeddings]
+
+            # 拼接条件潜在表示和文本嵌入 [conditional latents][text embeddings]
             conds_text_emb = [
                 conditional_latents.squeeze(0) if single_cond else conditional_latents[i],
                 text_emb,
             ]
-            # +1 for the start_mel_token
+
+            # 创建注意力掩码（目标长度+1，+1是为了起始mel token）
             attention_mask = torch.ones(target_len+1, dtype=torch.long, device=device)
-            # check this text input is padded
+
+            # 检查文本输入是否有填充
             padding: int = L + 2 - text_input.size(-1)
-            # pad left of [cond][text] -> [pad][cond][text]
+
+            # 如果存在填充，在条件嵌入前添加零填充 / pad left of [cond][text] -> [pad][cond][text]
             if padding > 0:
                 pad = torch.zeros((padding, conditional_latents.size(-1)), dtype=text_emb.dtype, device=device) # [p, dim]
                 conds_text_emb.insert(0, pad)
                 attention_mask[:padding] = 0
+
+            # 拼接所有嵌入：[pad(可选)][cond][text]
             mel_emb = torch.cat(conds_text_emb) #[s, dim]
             assert mel_emb.shape[0] == target_len, f"mel_emb.shape: {mel_emb.shape}, target_len: {target_len}"
+
+            # 将处理好的嵌入和掩码添加到列表中
             batched_mel_emb.append(mel_emb)
             attention_masks.append(attention_mask)
-        # [b, s, dim]
+        # 将列表中的嵌入堆叠成批次张量 [batch_size, sequence_length, embedding_dim]
         batched_mel_emb = torch.stack(batched_mel_emb, dim=0)
-        # [b, s+1]
+        # 将列表中的注意力掩码堆叠成批次张量 [batch_size, sequence_length+1]
         attention_mask = torch.stack(attention_masks, dim=0)
-        # [b, s+1]
+
+        # 创建伪输入ID（实际生成时不会使用，但HuggingFace API需要） [batch_size, sequence_length+1]
         fake_inputs = torch.ones(
             (
                 batched_mel_emb.shape[0],
@@ -692,93 +780,130 @@ class UnifiedVoice(nn.Module):
             dtype=torch.long,
             device=device,
         )
+        # 在序列末尾设置起始mel token
         fake_inputs[:, -1] = self.start_mel_token
         return fake_inputs, batched_mel_emb, attention_mask
 
     def inference_speech(self, speech_condition, text_inputs, emo_speech_condition=None, cond_lengths=None, emo_cond_lengths=None, emo_vec=None, use_speed=False, input_tokens=None, num_return_sequences=1,
                          max_generate_length=None, typical_sampling=False, typical_mass=.9, **hf_generate_kwargs):
         """
+        推理时对模型输入的条件与文本的预处理
+
         Args:
-            speech_condition: (b, d, frames) or (d, frames)
-            text_inputs: (b, L)
-            cond_mel_lengths: lengths of the conditioning mel spectrograms in shape (b,) or (1,)
-            input_tokens: additional tokens for generation in shape (b, s) or (s,)
-            max_generate_length: limit the number of generated tokens
-            hf_generate_kwargs: kwargs for `GPT2InferenceModel.generate(**hf_generate_kwargs)`
+            speech_condition: 语音条件特征 (batch, dim, frames) 或 (dim, frames)
+            text_inputs: 文本输入 (batch, length)
+            emo_speech_condition: 情感语音条件特征
+            cond_lengths: 条件mel谱图的长度 (batch,) 或 (1,)
+            emo_cond_lengths: 情感条件mel谱图的长度
+            emo_vec: 情感向量
+            use_speed: 是否使用速度控制
+            input_tokens: 用于生成的额外token (batch, seq) 或 (seq,)
+            num_return_sequences: 返回的序列数量
+            max_generate_length: 生成token的最大数量限制
+            typical_sampling: 是否使用典型采样
+            typical_mass: 典型采样的质量参数
+            hf_generate_kwargs: 传递给GPT2生成模型的参数
         """
 
-        if speech_condition.ndim == 2:
+        if speech_condition.ndim == 2:  # 处理单样本情况，添加批次维度
             speech_condition = speech_condition.unsqueeze(0)
-        if emo_speech_condition is None:
+        if emo_speech_condition is None:  # 如果没有提供情感语音条件，使用普通语音条件
             emo_speech_condition = speech_condition
-        if cond_lengths is None:
+        if cond_lengths is None:  # 如果没有提供条件长度，使用语音条件的最后一维大小
             cond_lengths = torch.tensor([speech_condition.shape[-1]], device=speech_condition.device)
-        if emo_cond_lengths is None:
-            emo_cond_lengths = torch.tensor([emo_speech_condition.shape[-1]], device=speech_condition.device) 
+        if emo_cond_lengths is None:  # 如果没有提供情感条件长度，使用情感语音条件的最后一维大小
+            emo_cond_lengths = torch.tensor([emo_speech_condition.shape[-1]], device=speech_condition.device)
 
+        # 获取语音条件潜在表示
         speech_conditioning_latent = self.get_conditioning(speech_condition.transpose(1,2), cond_lengths)
+
+        # 处理情感向量
         if emo_vec is None:
             print('compute emo vec')
+            # 从情感语音条件计算情感向量
             emo_vec = self.get_emo_conditioning(emo_speech_condition.transpose(1,2), emo_cond_lengths)
-            emo_vec = self.emovec_layer(emo_vec)
-            emo_vec = self.emo_layer(emo_vec)
+            emo_vec = self.emovec_layer(emo_vec)  # 情感向量层处理
+            emo_vec = self.emo_layer(emo_vec)     # 情感层处理
         else:
             print('Use the specified emotion vector')
 
+        # 创建持续时间嵌入（速度控制相关）
         tmp = torch.zeros(text_inputs.size(0)).to(text_inputs.device)
-        duration_emb =  self.speed_emb(torch.zeros_like(tmp).long())
-        duration_emb_half = self.speed_emb(torch.ones_like(tmp).long())
+        duration_emb =  self.speed_emb(torch.zeros_like(tmp).long())        # 正常速度嵌入
+        duration_emb_half = self.speed_emb(torch.ones_like(tmp).long())     # 半速嵌入
+
+        # 合并所有条件：语音条件 + 情感向量 + 速度嵌入
         conds_latent = torch.cat((speech_conditioning_latent + emo_vec.unsqueeze(1), duration_emb_half.unsqueeze(1), duration_emb.unsqueeze(1)), 1)
+        # 准备GPT模型的输入
         input_ids, inputs_embeds, attention_mask = self.prepare_gpt_inputs(conds_latent, text_inputs)
+
+        # 存储mel嵌入到推理模型中
         self.inference_model.store_mel_emb(inputs_embeds)
+
+        # 处理输入token
         if input_tokens is None:
             inputs = input_ids
         else:
+            # 处理单样本情况
             if input_tokens.ndim == 1:
                 input_tokens = input_tokens.unsqueeze(0)
+
+            # 检查返回序列数量的可除性
             assert num_return_sequences % input_tokens.shape[0] == 0, \
-                    "The num_return_sequences must be divisible by the batch number of input_tokens"
+                    "返回序列数量必须能被输入token的批次数量整除"
             assert num_return_sequences % text_inputs.shape[0] == 0, \
-                    "The num_return_sequences must be divisible by the batch number of text_inputs"
+                    "返回序列数量必须能被文本输入的批次数量整除"
+
+            # 扩展输入以匹配返回序列数量
             b = num_return_sequences // input_ids.shape[0]
             if b > 1:
                 input_ids = input_ids.repeat(b, 1)
                 attention_mask = attention_mask.repeat(b, 1)
+
+            # 重复输入token并拼接
             input_tokens = input_tokens.repeat(num_return_sequences // input_tokens.shape[0], 1)
             inputs = torch.cat([input_ids, input_tokens], dim=1)
             attention_mask = F.pad(attention_mask, (0, input_tokens.shape[1]), value=1)
+
+        # 记录截断索引（条件部分的结束位置）
         trunc_index = inputs.shape[1]
+
+        # 创建logits处理器列表
         logits_processor = LogitsProcessorList()
+        # 如果使用典型采样，添加对应的处理器
         if typical_sampling:
-            # employ custom typical sampling
+            # 使用自定义典型采样 / employ custom typical sampling
             if not (typical_mass > 0.0 and typical_mass < 1.0):
                 raise ValueError(f"`typical_mass` has to be a float > 0 and < 1, but is {typical_mass}")
             min_tokens_to_keep = 2 if hf_generate_kwargs.get("num_beams", 1) > 1 else 1
             logits_processor.append(TypicalLogitsWarper(mass=typical_mass, min_tokens_to_keep=min_tokens_to_keep))
+        # 计算最大生成长度
         max_length = (trunc_index + self.max_mel_tokens - 1) if max_generate_length is None else trunc_index + max_generate_length
         
-        # Use accel engine if available (single sequence only)
+        # 使用加速引擎（仅支持单序列） / Use accel engine if available (single sequence only)
         if self.accel_engine is not None and num_return_sequences == 1:
             output = self.accel_engine.generate(
-                inputs,  # fake input_ids (all 1s + start_mel_token)
-                max_new_tokens=max_length - trunc_index,
-                attention_mask=attention_mask,
-                temperature=hf_generate_kwargs.get('temperature', 1),
-                stop_tokens=[self.stop_mel_token],
-                tts_embeddings=inputs_embeds,  # [pad][cond][text] embeddings (87 tokens, NO start_mel_token)
+                inputs,  # 伪输入ID（全是1 + 起始mel token） / fake input_ids (all 1s + start_mel_token)
+                max_new_tokens=max_length - trunc_index,  # 最大新生成token数
+                attention_mask=attention_mask,  # 注意力掩码
+                temperature=hf_generate_kwargs.get('temperature', 1),  # 温度参数
+                stop_tokens=[self.stop_mel_token],  # 停止token
+                tts_embeddings=inputs_embeds,  # TTS嵌入 [pad][cond][text] 嵌入 / [pad][cond][text] embeddings (87 tokens, NO start_mel_token)
                 tts_mel_embedding=self.inference_model.embeddings,  # mel_embedding layer
                 tts_text_pos_embedding=self.inference_model.text_pos_embedding,  # text_pos_embedding layer
             )
         else:
+            # 使用标准推理模型生成
             output = self.inference_model.generate(inputs, 
                                                 bos_token_id=self.start_mel_token, pad_token_id=self.stop_mel_token,
                                                 eos_token_id=self.stop_mel_token, attention_mask=attention_mask,
                                                 max_length=max_length, logits_processor=logits_processor,
                                                 num_return_sequences=num_return_sequences,
                                                 **hf_generate_kwargs)
+        # 处理输出结果，移除条件部分
         if isinstance(output, torch.Tensor):
-            return output[:, trunc_index:], speech_conditioning_latent
-        # GenerateOutput
+            return output[:, trunc_index:], speech_conditioning_latent  # 返回生成的mel token和语音条件
+        # 如果是GenerateOutput对象，同样处理序列
         output.sequences = output.sequences[:, trunc_index:]
         return output, speech_conditioning_latent
 

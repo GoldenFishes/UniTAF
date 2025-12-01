@@ -561,6 +561,7 @@ class IndexTTSExperiment:
         for i, emo_name in enumerate(self.emotion_vectors_map.keys()):
             print(f"  {i + 1:2d}. {emo_name:12} -> {self.emotion_vectors_map[emo_name]}")
 
+    # TTS audio 与 GT audio 对比实验 -------------------------------------------------------------------------------------
     def compare_tts_audio_and_GT_audio(
         self,
         num_of_samples = 15,  # 只实验数据集中前N个样本
@@ -841,6 +842,8 @@ class IndexTTSExperiment:
         except Exception as e:
             print(f"加载文本失败 {text_path}: {e}")
             return ""
+
+    # ------------------------------------------------------------------------------------------------------------------
 
 
 if __name__ == "__main__":

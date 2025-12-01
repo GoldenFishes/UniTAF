@@ -662,6 +662,7 @@ class IndexTTS2:
                         # print(f"[DEBUG] 混合后emovec: {emovec.shape}")  # torch.Size([1, 1280])
 
                     # 语音推理生成语义编码
+                    # codes相当于"音频的文本"是压缩的音频内容表示；speech_conditioning_latent相当于"说话人的声音指纹"是说话人身份的学表示
                     codes, speech_conditioning_latent = self.gpt.inference_speech(
                         spk_cond_emb,
                         text_tokens,
