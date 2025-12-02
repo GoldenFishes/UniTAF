@@ -5,6 +5,7 @@
 
 
 import json
+import sys
 import os
 import random
 import re
@@ -20,8 +21,6 @@ from torch.utils.data import Dataset
 
 # 导入unitaf项目支持的数据集字典
 from unitaf_dataset_support_config import unitaf_dataset_support_config
-
-
 
 
 class UniTAFDataset(Dataset):
@@ -46,7 +45,7 @@ class UniTAFDataset(Dataset):
             self.dataset_config["dataset_root_path"],
             self.sub_dataset_config["dirname"]
         )
-        print("[DEBUG] prepare_dataset() 中 sub_dataset_path:", self.sub_dataset_path)
+        # print("[]DEBUG prepare_dataset() 中 sub_dataset_path:", self.sub_dataset_path)
         '''
         期望从数据集中获取到的每个样本sample格式为：
         {
@@ -75,6 +74,7 @@ class UniTAFDataset(Dataset):
         '''
         if "IndexTTS2" in self.dataset_config["tts_model"]:
             # 初始化IndexTTS2预处理模块
+            from omegaconf import OmegaConf
             from indextts.gpt.model_v2 import UnifiedVoice
             from indextts.utils.front import TextNormalizer, TextTokenizer
             from unitaf_train_component.indextts2_train_component import SemanticExtractor
@@ -82,63 +82,24 @@ class UniTAFDataset(Dataset):
             from huggingface_hub import hf_hub_download
             import safetensors.torch
 
-            self.tokenizer = TextTokenizer
+            # config来源于index-tts/checkpoints/config.yaml
+            indextts2_cfg = OmegaConf.load(Path("checkpoints/config.yaml"))
+
+            self.tokenizer = TextTokenizer(
+                str(Path("checkpoints/bpe.model")),
+                TextNormalizer(),
+            )
 
             stats_path = Path("checkpoints/wav2vec2bert_stats.pt")
             self.semantic_extractor = SemanticExtractor(stats_path, self.dataset_config["device"])
 
-            # config来源于index-tts/checkpoints/config.yaml
-            semantic_codec_config = {
-                'codebook_size': 8192,
-                'hidden_size': 1024,
-                'codebook_dim': 8,
-                'vocos_dim': 384,
-                'vocos_intermediate_dim': 2048,
-                'vocos_num_layers': 12
-            }
-
-            self.semantic_codec = build_semantic_codec(semantic_codec_config)
+            self.semantic_codec = build_semantic_codec(indextts2_cfg.semantic_codec)
             semantic_code_ckpt = hf_hub_download("amphion/MaskGCT", filename="semantic_codec/model.safetensors")
             safetensors.torch.load_model(self.semantic_codec, semantic_code_ckpt)
             self.semantic_codec = self.semantic_codec.to(self.dataset_config["device"])
             self.semantic_codec.eval()
 
-            # config来源于index-tts/checkpoints/config.yaml
-            gpt_config = {
-                "model_dim": 1280,
-                "max_mel_tokens": 1815,
-                "max_text_tokens": 600,
-                "heads": 20,
-                "use_mel_codes_as_input": True,
-                "mel_length_compression": 1024,
-                "layers": 24,
-                "number_text_tokens": 12000,
-                "number_mel_codes": 8194,
-                "start_mel_token": 8192,
-                "stop_mel_token": 8193,
-                "start_text_token": 0,
-                "stop_text_token": 1,
-                "train_solo_embeddings": False,
-                "condition_type": "conformer_perceiver",
-                "condition_module": {
-                    "output_size": 512,
-                    "linear_units": 2048,
-                    "attention_heads": 8,
-                    "num_blocks": 6,
-                    "input_layer": "conv2d2",
-                    "perceiver_mult": 2
-                },
-                "emo_condition_module": {
-                    "output_size": 512,
-                    "linear_units": 1024,
-                    "attention_heads": 4,
-                    "num_blocks": 4,
-                    "input_layer": "conv2d2",
-                    "perceiver_mult": 2
-                }
-            }
-
-            gpt = UnifiedVoice(gpt_config)
+            gpt = UnifiedVoice(**indextts2_cfg.gpt)
             ckpt = torch.load("checkpoints/gpt.pth", map_location="cpu")
             state = ckpt.get("model", ckpt)
             gpt.load_state_dict(state, strict=False)
@@ -180,10 +141,12 @@ class UniTAFDataset(Dataset):
             self.sub_dataset_config["dirname"],
             f"{dataset_type}.json",
         )
-        print("[DEBUG] prepare_dataset() 中 json_path:", json_path)
+        print("[UniTAFDataset] prepare_dataset() 中加载json路径:", json_path)
 
         with open(json_path, 'r', encoding='utf-8') as f:
             raw_data = json.load(f)
+
+        info = raw_data["info"]
 
         # 获取每一个样本
         samples = []
@@ -214,16 +177,15 @@ class UniTAFDataset(Dataset):
                 }
 
                 # 为每个chunk对创建新的样本
-                # FIXME:这里sample中先不包含"speaker_id_list",如果后面UniTalker模块需要再修复这里
                 processed_item = {
-                    "speaker_idx": item["speaker_idx"],
+                    "speaker_id": info["speaker_id_list"][item["speaker_idx"]],  # 这里将speaker的idx转为了id
                     "sample_id": item['sample_id'],
                     "pair_id": f"{chunk1_key}_{chunk2_key}",  # 添加pair_id标识
                     "chunk": new_chunk
                 }
                 samples.append(processed_item)
 
-        print(f"[DEBUG] 总共生成 {len(samples)} 个chunk对样本")
+        print(f"[UniTAFDataset] 总共生成 {len(samples)} 个chunk对样本")
         return samples
 
     # 根据sample中的文件路径，预处理成模型的直接输入
@@ -244,8 +206,8 @@ class UniTAFDataset(Dataset):
         output = {}
         # 填入时长
         output["duration"] = second_chunk["duration"]
-        output["speaker_id"] = second_chunk["speaker_id"]
-        output["sample_id"] = second_chunk["sample_id"]
+        # output["speaker_id"] = second_chunk["speaker_id"]
+        output["sample_id"] = sample["sample_id"]
 
         if "IndexTTS2" in self.dataset_config["tts_model"]:
             '''
@@ -303,14 +265,14 @@ class UniTAFDataset(Dataset):
             output["tts_condition_len"] = cond_lengths
             # 文本token
             output["text_ids"] = text_ids
-            output["text_ids_len"] = len(text_ids.size)
+            output["text_ids_len"] = torch.tensor(len(text_ids), dtype=torch.long)
             # GT音频
             output["audio_codes"] = gt_semantic_code
             output["audio_codes_len"] = gt_lengths
             # 情感向量
             output["emotion_vector"] = emo_vec
 
-        if "UniTalker" in dataset_config["a2f_model"]:
+        if "UniTalker" in self.dataset_config["a2f_model"]:
             '''
             获取样本中文件路径得到
                 face_path 表情文件路径
@@ -337,9 +299,14 @@ class UniTAFDataset(Dataset):
             # 3. 将不间断空格（non-breaking space）替换为普通空格
             text = text.replace("\xa0", " ")
             return text.strip()
+        else:
+            return text.strip()
 
 
     def load_audio(self, audio_path, target_sr: int) -> Tuple[torch.Tensor, int]:
+        # 修复路径分隔符
+        audio_path = audio_path.replace('\\', '/')
+
         full_path = os.path.join(
             self.dataset_config["dataset_root_path"],
             self.sub_dataset_config["dirname"],
@@ -355,6 +322,9 @@ class UniTAFDataset(Dataset):
         return wav, sr
 
     def load_text_file(self, text_path):
+        # 修复路径分隔符
+        text_path = text_path.replace('\\', '/')
+
         full_path = os.path.join(
             self.dataset_config["dataset_root_path"],
             self.sub_dataset_config["dirname"],
@@ -374,15 +344,186 @@ if __name__ == '__main__':
     '''
     python unitaf_train/unitaf_dataset.py
     '''
+    # 添加项目根目录到Python路径
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.dirname(current_dir)  # unitaf_train的父目录
+    sys.path.insert(0, project_root)
+
+    from torch.utils.data import DataLoader
+
+    # 检查CUDA是否可用
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    print(f"使用设备: {device}")
+
     dataset_config = {
         # 模型类型，这里用于指导dataset类采用哪种预处理方法来准备模型的输入
         "tts_model": ["IndexTTS2"],
         "a2f_model": ["UniTalker"],
         # 数据集根目录
-        "dataset_root_path": "data/UniTAF Dataset",
+        "dataset_root_path": "/home/zqg/project/data/UniTAF Dataset", # 使用绝对路径
         "dataset": "D12",  # 支持多数据集训练，对应unitaf_dataset_support_config中具体数据集
         # 预处理组件所在设备
         "device": "cuda:0",
     }
 
-    dataset = UniTAFDataset(dataset_config, dataset_type="train")
+    print("开始测试 UniTAFDataset...")
+    print("-" * 50)
+
+    try:
+        # 1. 测试数据集初始化
+        print("1. 初始化数据集...")
+        dataset = UniTAFDataset(dataset_config, dataset_type="train")  # 对应{dataset_type}.json文件
+        print(f"✓ 数据集初始化成功")
+        print(f"  数据集大小: {len(dataset)} 个样本")
+        print(f"  子数据集路径: {dataset.sub_dataset_path}")
+
+        # 2. 测试样本访问
+        print("\n2. 测试样本访问...")
+        if len(dataset) > 0:
+            try:
+                # 测试单个样本
+                print(f"  获取第一个样本...")
+                sample_0 = dataset[0]
+                print(f"  ✓ 获取成功")
+                print(f"  样本键: {list(sample_0.keys())}")
+
+                # 显示每个键的类型和形状
+                print(f"\n  样本内容:")
+                for key, value in sample_0.items():
+                    if isinstance(value, torch.Tensor):
+                        print(f"    {key}: Tensor {tuple(value.shape)}")
+                    elif isinstance(value, list):
+                        print(f"    {key}: List[{len(value)}]")
+                    else:
+                        print(f"    {key}: {type(value).__name__}")
+
+                # 测试批量访问
+                print(f"\n  测试批量获取...")
+                indices = [0, 1, 2]
+                batch_samples = dataset[indices]
+                print(f"  ✓ 批量获取成功, 获取了 {len(batch_samples)} 个样本")
+
+            except Exception as e:
+                print(f"  ✗ 样本访问失败: {e}")
+                import traceback
+
+                traceback.print_exc()
+        else:
+            print("  ✗ 数据集为空")
+
+        # 3. 测试多个样本
+        print("\n3. 测试多个样本...")
+        num_samples_to_test = min(5, len(dataset))
+        successful_samples = 0
+
+        for i in range(num_samples_to_test):
+            try:
+                sample = dataset[i]
+                if sample is not None:
+                    successful_samples += 1
+            except Exception as e:
+                print(f"  样本 {i} 失败: {e}")
+
+        print(f"  成功处理 {successful_samples}/{num_samples_to_test} 个样本")
+
+        # 4. 测试DataLoader
+        print("\n4. 测试DataLoader...")
+        try:
+            # 自定义collate函数
+            def custom_collate_fn(batch):
+                """处理不同长度的数据"""
+                collated = {}
+                for key in batch[0].keys():
+                    if isinstance(batch[0][key], torch.Tensor):
+                        # 对于tensor，直接stack
+                        collated[key] = torch.stack([item[key] for item in batch])
+                    elif isinstance(batch[0][key], list):
+                        # 对于列表，保持原样
+                        collated[key] = [item[key] for item in batch]
+                    else:
+                        # 其他类型
+                        collated[key] = [item[key] for item in batch]
+                return collated
+
+
+            dataloader = DataLoader(
+                dataset,
+                batch_size=2,
+                shuffle=True,
+                collate_fn=custom_collate_fn,
+                num_workers=0  # 先设置为0避免多进程问题
+            )
+
+            # 获取一个batch
+            for batch in dataloader:
+                print(f"  ✓ DataLoader成功创建batch")
+                print(f"    Batch键: {list(batch.keys())}")
+
+                # 检查batch中每个字段的形状
+                for key, value in batch.items():
+                    if isinstance(value, torch.Tensor):
+                        print(f"    {key}: {tuple(value.shape)}")
+                    elif isinstance(value, list):
+                        print(f"    {key}: {len(value)}个元素")
+                break
+
+        except Exception as e:
+            print(f"  ✗ DataLoader测试失败: {e}")
+            import traceback
+
+            traceback.print_exc()
+
+        # 5. 验证样本数据
+        print("\n5. 验证样本数据完整性...")
+        if len(dataset) > 0:
+            sample = dataset[0]
+
+            # 检查必要字段
+            required_fields = ["tts_condition", "text_ids", "audio_codes", "emotion_vector"]
+            missing_fields = [field for field in required_fields if field not in sample]
+
+            if missing_fields:
+                print(f"  ✗ 缺少必要字段: {missing_fields}")
+            else:
+                print(f"  ✓ 所有必要字段都存在")
+
+                # 检查字段类型和有效性
+                checks = [
+                    ("tts_condition", torch.Tensor, "condition向量"),
+                    ("text_ids", list, "文本ID列表"),
+                    ("audio_codes", torch.Tensor, "音频token"),
+                    ("emotion_vector", (list, torch.Tensor, np.ndarray), "情感向量"),
+                ]
+
+                for field, expected_type, desc in checks:
+                    value = sample[field]
+                    if isinstance(expected_type, tuple):
+                        valid = any(isinstance(value, t) for t in expected_type)
+                    else:
+                        valid = isinstance(value, expected_type)
+
+                    if valid:
+                        print(f"    {field}({desc}): ✓ 类型正确")
+                    else:
+                        print(f"    {field}({desc}): ✗ 类型错误, 实际类型: {type(value)}")
+
+        print("\n" + "=" * 50)
+        print("测试完成!")
+
+    except FileNotFoundError as e:
+        print(f"✗ 文件未找到错误: {e}")
+        print("请检查:")
+        print(f"  1. dataset_root_path: {dataset_config['dataset_root_path']}")
+        print(f"  2. dataset: {dataset_config['dataset']}")
+        print(f"  3. 确保有对应的train.json文件")
+
+    except ImportError as e:
+        print(f"✗ 导入错误: {e}")
+        print("请确保所有依赖包已安装:")
+        print("  pip install torch torchaudio transformers huggingface-hub safetensors")
+
+    except Exception as e:
+        print(f"✗ 初始化失败: {e}")
+        import traceback
+
+        traceback.print_exc()
