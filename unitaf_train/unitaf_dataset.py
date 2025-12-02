@@ -275,18 +275,40 @@ class UniTAFDataset(Dataset):
         if "UniTalker" in self.dataset_config["a2f_model"]:
             '''
             获取样本中文件路径得到
-                face_path 表情文件路径
+                face_data 表情文件路径
                 face_type 表情标注类型，flame，arkit这种
-                face_fps
-                
+                face_fps 表情帧率
             '''
-            # TODO:这里是否需要预处理
-            output["face_path"] = second_chunk["face_path"]
-            output["face_type"] = second_chunk["face_type"]
-            output["face_fps"] = second_chunk["face_fps"]
+            face_data = self.load_npy_array(second_chunk["face_path"])
+            face_type = second_chunk["face_type"]
+            face_fps = second_chunk["face_fps"]
+
+            # 获取音频信息（用于对齐）
+            audio_duration = second_chunk["duration"]
+
+            if "IndexTTS2" in self.dataset_config["tts_model"]:
+                '''
+                如果tts是IndexTTS2，则tts默认采用24k hz，压缩率1024，
+                1个音频token ≈ 1024个原始音频样本 ≈ 1024/24000 ≈ 0.04267秒。
+                
+                在 face_fps = 25 下，1个音频token ≈ 0.04267 × 25 ≈ 1.0667个面部帧
+                此时，面部数据应该大致与音频token对齐
+                '''
+                if face_fps != 25:
+                    # 重采样face_fps至于25fps
+                    face_data = self.resample_face_data_to_target_fps(
+                        face_data=face_data,
+                        source_fps=face_fps,
+                        target_fps=25,
+                        duration=audio_duration
+                    )
+                    face_fps = 25
+
+            output["face_data"] = face_data
+            output["face_type"] = face_type
+            output["face_fps"] = face_fps
 
         return output
-
 
     # ------------------------------------------------------------------------------------------------------
     # 工具方法
@@ -301,7 +323,6 @@ class UniTAFDataset(Dataset):
             return text.strip()
         else:
             return text.strip()
-
 
     def load_audio(self, audio_path, target_sr: int) -> Tuple[torch.Tensor, int]:
         # 修复路径分隔符
@@ -338,6 +359,95 @@ class UniTAFDataset(Dataset):
             print(f"加载文本文件失败: {full_path}, 错误: {e}")
             return ""
 
+    def load_npy_array(self, npy_path):
+        # 修复路径分隔符
+        npy_path = npy_path.replace('\\', '/')
+
+        full_path = os.path.join(
+            self.dataset_config["dataset_root_path"],
+            self.sub_dataset_config["dirname"],
+            npy_path
+        )
+
+        try:
+            npy_array = np.load(full_path)
+            return npy_array
+        except Exception as e:
+            print(f"加载npy数组文件失败: {full_path}, 错误: {e}")
+            return None
+
+    def resample_face_data_to_target_fps(self, face_data, source_fps, target_fps, duration=None):
+        """
+        将面部数据从源FPS重采样到目标FPS
+
+        Args:
+            face_data: numpy array, shape (num_frames, num_features)
+            source_fps: 原始帧率
+            target_fps: 目标帧率
+            duration: 可选，持续时间（秒），用于确定输出长度
+
+        Returns:
+            重采样后的面部数据
+        """
+        import numpy as np
+        from scipy import interpolate
+
+        # 如果数据为空，返回空数组
+        if len(face_data) == 0:
+            print(f"[WARNING] 面部数据为空")
+            return np.zeros((0,))
+
+        # 计算持续时间
+        if duration is None:
+            # 根据帧数计算持续时间
+            duration = len(face_data) / source_fps
+
+        print(f"[DEBUG] 面部数据重采样: {source_fps}FPS -> {target_fps}FPS, 时长: {duration:.2f}秒")
+        print(f"[DEBUG] 原始数据形状: {face_data.shape}")
+
+        # 创建原始时间轴（秒）
+        original_time = np.linspace(0, duration, len(face_data))
+
+        # 创建目标时间轴
+        target_num_frames = int(np.round(duration * target_fps))
+        if target_num_frames <= 0:
+            target_num_frames = 1
+
+        target_time = np.linspace(0, duration, target_num_frames)
+
+        # 处理不同维度的数据
+        if face_data.ndim == 1:
+            # 一维数据（如单个参数）
+            face_data = face_data.reshape(-1, 1)
+            num_features = 1
+        else:
+            # 多维数据（如 blendshape 权重）
+            num_features = face_data.shape[1]
+
+        # 初始化重采样后的数据
+        resampled_data = np.zeros((target_num_frames, num_features))
+
+        # 对每个特征进行线性插值
+        for i in range(num_features):
+            # 创建插值函数
+            interp_func = interpolate.interp1d(
+                original_time,
+                face_data[:, i],
+                kind='linear',  # 线性插值
+                fill_value="extrapolate"  # 外推边界值
+            )
+            # 插值到新时间点
+            resampled_data[:, i] = interp_func(target_time)
+
+        # 恢复原始维度
+        if num_features == 1:
+            resampled_data = resampled_data.flatten()
+
+        print(f"[DEBUG] 重采样后形状: {resampled_data.shape}")
+
+        return resampled_data
+
+
 
 
 if __name__ == '__main__':
@@ -350,10 +460,6 @@ if __name__ == '__main__':
     sys.path.insert(0, project_root)
 
     from torch.utils.data import DataLoader
-
-    # 检查CUDA是否可用
-    device = "cuda:0" if torch.cuda.is_available() else "cpu"
-    print(f"使用设备: {device}")
 
     dataset_config = {
         # 模型类型，这里用于指导dataset类采用哪种预处理方法来准备模型的输入
@@ -527,3 +633,61 @@ if __name__ == '__main__':
         import traceback
 
         traceback.print_exc()
+
+'''
+2. 测试样本访问...
+  获取第一个样本...
+/home/shared/miniconda3/envs/zqg-indextts/lib/python3.11/site-packages/torchaudio/_backend/utils.py:213: UserWarning: In2.9, this function's implementation will be changed to use torchaudio.load_with_torchcodec` under the hood. Some parameters like ``normalize``, ``format``, ``buffer_size``, and ``backend`` will be ignored. We recommend that you port your code to rely directly on TorchCodec's decoder instead: https://docs.pytorch.org/torchcodec/stable/generated/torchcodec.decoders.AudioDecoder.html#torchcodec.decoders.AudioDecoder.
+  warnings.warn(
+/home/shared/miniconda3/envs/zqg-indextts/lib/python3.11/site-packages/torchaudio/_backend/ffmpeg.py:88: UserWarning: torio.io._streaming_media_decoder.StreamingMediaDecoder has been deprecated. This deprecation is part of a large refactoring effort to transition TorchAudio into a maintenance phase. The decoding and encoding capabilities of PyTorch for both audio and video are being consolidated into TorchCodec. Please see https://github.com/pytorch/audio/issues/3902 for more information. It will be removed from the 2.9 release.
+  s = torchaudio.io.StreamReader(src, format, None, buffer_size)
+  ✓ 获取成功
+  样本键: ['duration', 'sample_id', 'tts_condition', 'tts_condition_len', 'text_ids', 'text_ids_len', 'audio_codes', 'audio_codes_len', 'emotion_vector', 'face_path', 'face_type', 'face_fps']
+
+  样本内容:
+    duration: float
+    sample_id: str
+    tts_condition: Tensor (1, 32, 1280)
+    tts_condition_len: Tensor (1,)
+    text_ids: List[84]
+    text_ids_len: Tensor ()
+    audio_codes: Tensor (399,)
+    audio_codes_len: Tensor (1,)
+    emotion_vector: List[8]
+    face_path: str
+    face_type: str
+    face_fps: int
+
+  测试批量获取...
+  ✓ 批量获取成功, 获取了 3 个样本
+
+3. 测试多个样本...
+  成功处理 5/5 个样本
+
+4. 测试DataLoader...
+  ✓ DataLoader成功创建batch
+    Batch键: ['duration', 'sample_id', 'tts_condition', 'tts_condition_len', 'text_ids', 'text_ids_len', 'audio_codes', 'audio_codes_len', 'emotion_vector', 'face_path', 'face_type', 'face_fps']
+    duration: 2个元素
+    sample_id: 2个元素
+    tts_condition: (2, 1, 32, 1280)
+    tts_condition_len: (2, 1)
+    text_ids: 2个元素
+    text_ids_len: (2,)
+    audio_codes: (2, 399)
+    audio_codes_len: (2, 1)
+    emotion_vector: 2个元素
+    face_path: 2个元素
+    face_type: 2个元素
+    face_fps: 2个元素
+
+5. 验证样本数据完整性...
+  ✓ 所有必要字段都存在
+    tts_condition(condition向量): ✓ 类型正确
+    text_ids(文本ID列表): ✓ 类型正确
+    audio_codes(音频token): ✓ 类型正确
+    emotion_vector(情感向量): ✓ 类型正确
+
+==================================================
+测试完成!
+
+'''
