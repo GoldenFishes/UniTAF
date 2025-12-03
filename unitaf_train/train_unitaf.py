@@ -15,6 +15,7 @@ from torch.utils.data import DataLoader, ConcatDataset
 from transformers import get_cosine_schedule_with_warmup
 from torch.nn.utils.rnn import pad_sequence
 
+from FunASR.funasr.models.eres2net.eres2net import conv1x1
 # UniTextAudioFace的dataset
 from unitaf_dataset import UniTAFDataset
 # 组装联合模型UniTextAudioFace的类
@@ -35,8 +36,7 @@ class UniTAFTrainer():
 
         # 初始化模型
         self.model = UniTextAudioFaceModel(
-            tts_model_name=train_config["tts_model"],
-            a2f_model_name=train_config["a2f_model"],
+            cfg=train_config,
             device=self.device,
         )
 
@@ -45,7 +45,9 @@ class UniTAFTrainer():
         self,
         batch,
     ):
+        device = self.device
         loss = {}
+        # 1. TTS部分计算出TTS核心输出
         if "IndexTTS2" in self.train_config["tts_model"]:
             """
             对于IndexTTS2部分,参考来源：https://github.com/JarodMica/index-tts/blob/training_v2/trainers/train_gpt_v2.py 中 compute_loss()
@@ -58,8 +60,6 @@ class UniTAFTrainer():
             """
             use_duration_control = self.train_config["IndexTTS2"]["use_duration_control"]
             duration_dropout = self.train_config["IndexTTS2"]["duration_dropout"]
-
-            device = self.device
 
             tts_condition = batch["tts_condition"].to(device)
             text_ids = batch["text_ids"].to(device)
@@ -143,6 +143,36 @@ class UniTAFTrainer():
             loss["tts_mel_loss"] = mel_loss
             loss["tts_metrics"] = metrics
 
+            # TODO: IndexTTS取哪里的feature？
+
+        # 2. TODO：获得TTS部分核心输出 处理成audio feature
+
+        audio_feature=
+
+        # 3. A2F Decoder接收audio feature
+        if "UniTalker" in self.train_config["a2f_model"]:
+            """
+            从batch中获得：
+                speaker_idx 说话人idx
+                face_data 表情数据
+                face_template 表情数据格式的偏置
+                face_type 表情数据的格式
+                face_fps 表情帧率
+            """
+            face_data = batch["face_data"].to(device, non_blocking=True)
+            face_type = batch["face_type"][0]
+            identity = batch["speaker_idx"].to(device, non_blocking=True)
+            face_template = batch["face_template"].to(device, non_blocking=True)
+
+            out_motion, out_pca, gt_pca = self.model.a2f_model(
+                audio_feature=audio_feature, template=face_template, face_motion=face_data,
+                style_idx=identity ,annot_type=face_type,
+            )
+            # 由我们单独实现的unitalker_decoder_component.UniTalkerDecoder.compute_loss()中计算loss
+            rec_loss, pca_loss = self.model.a2f_model.compute_loss(out_motion, face_data, face_type, out_pca, gt_pca)
+
+            loss["a2f_rec_loss"] = rec_loss
+            loss["a2f_pca_loss"] = pca_loss
 
         return loss
 
@@ -185,11 +215,14 @@ class UniTAFTrainer():
         if "UniTalker" in self.train_config["a2f_model"]:
             '''
             接收到batch
+                说话人idx     speaker_idx
                 表情数据      face_data
+                表情数据的偏置  face_template
                 表情标注格式   face_type
                 表情帧率      face_fps
             '''
-            # TODO
+            # 这里似乎不需要对UniTalker的内容做额外的计算
+            pass
 
 
         return output
@@ -218,16 +251,15 @@ class UniTAFTrainer():
 
         # 2. 遍历所有子数据集
         for subdataset in dataset_list:
-            dataset_config["dataset"] = subdataset
 
             try:
-                train_dataset = UniTAFDataset(dataset_config, dataset_type="train")
+                train_dataset = UniTAFDataset(dataset_config, dataset_type="train", dataset_name=subdataset)
                 train_datasets.append(train_dataset)
             except Exception as e:
                 print(f"[UniTAFTrainer][setup_dataloader] 数据集{subdataset}没有train训练集，跳过。")
 
             try:
-                val_dataset = UniTAFDataset(dataset_config, dataset_type="val")
+                val_dataset = UniTAFDataset(dataset_config, dataset_type="val", dataset_name=subdataset)
                 val_datasets.append(val_dataset)
             except Exception as e:
                 print(f"[UniTAFTrainer][setup_dataloader] 数据集{subdataset}没有val验证集，跳过。")
@@ -291,7 +323,7 @@ class UniTAFTrainer():
         recent_checkpoints: List[str] = []
         last_saved_step: int | None = None
 
-        # TODO: resume train
+        # TODO: resume train恢复训练设置
 
         self.model.train()  # UniTAF联合模型
         optimizer.zero_grad(set_to_none=True)
@@ -309,8 +341,7 @@ class UniTAFTrainer():
                     if "IndexTTS2" in self.train_config["tts_model"]:
                         tts_loss = self.train_config["IndexTTS2"]["text_loss_weight"] * loss["text_loss"] + self.train_config["IndexTTS2"]["mel_loss_weight"] * loss["mel_loss"]
                     if "UniTalker" in self.train_config["a2f_model"]:
-                        # TODO
-                        a2f_loss =
+                        a2f_loss = loss["a2f_rec_loss"] + self.train_config["UniTalker"]["pca_weight"] * loss["a2f_pca_loss"]
 
 
                     # TODO: a2f loss
@@ -343,11 +374,6 @@ class UniTAFTrainer():
                                 val_dataloader
                             )
 
-        
-
-
-
-
 
 
 
@@ -364,10 +390,35 @@ if __name__ == '__main__':
         # 模型类型，这里用于指导训练器类训练哪些模型
         "tts_model": ["IndexTTS2"],
         "a2f_model": ["UniTalker"],
+
+        # 模型配置
+        "IndexTTS2": {
+            # TTS Loss计算时设置
+            "use_duration_control": False,
+            "duration_dropout": 0.3,
+            "text_loss_weight": 0.2,
+            "mel_loss_weight": 0.8,
+        },
+        "UniTalker": {
+            # UniTalker Decoder配置, 参数与UniTalker项目的config/unitalker.yaml一致
+            "interpolate_pos": 1,
+            "decoder_dimension": 256,
+            "decoder_type": "conv",
+            "period": 30,
+            "headlayer": 1,
+            # UniTalker Network
+            "use_pca": True,
+            "pca_dim": 256,
+            # A2F Loss计算时设置
+            "pca_weight": 0.01,
+        },
+
         # 数据集类
         "dataset_config": {
             "dataset_root_path": "/home/zqg/project/data/UniTAF Dataset",  # 使用绝对路径
             "dataset_list": ["D12"],  # 支持多数据集训练，对应unitaf_dataset_support_config中具体数据集
+            # unitaf_dataset_support_config是经过数据集格式转换UniTAFDataset能够支持的数据集
+            # UniTalker本身还有一个 a2f/dataset/dataset_config 记录UniTalker Decoder支持的数据集
         },
         # dataloader设置
         "num_workers": 2,
@@ -382,15 +433,6 @@ if __name__ == '__main__':
         "grad_accumulation": 1,
         "grad_clip": 1.0,
         "use_amp": True,
-
-
-        "IndexTTS2": {
-            # TTS Loss计算时设置
-            "use_duration_control": False,
-            "duration_dropout": 0.3,
-            "text_loss_weight": 0.2,
-            "mel_loss_weight": 0.8,
-        },
 
 
 

@@ -28,12 +28,13 @@ class UniTAFDataset(Dataset):
     def __init__(
         self,
         dataset_config,
+        dataset_name,
         dataset_support_config = unitaf_dataset_support_config,
         dataset_type = "train",
     ):
         self.dataset_config = dataset_config
         # 根据dataset_config["dataset"]设置的子数据集名称 如"DXX" 在dataset_support_config中获取相应sub_dataset_config
-        self.sub_dataset_config = dataset_support_config[dataset_config["dataset"]]
+        self.sub_dataset_config = dataset_support_config[dataset_name]  # sub_dataset_config对应UniTalker中具体数据集参数配置
 
         # 初始化用于数据预处理的模型
         self._init_process_model()
@@ -105,6 +106,10 @@ class UniTAFDataset(Dataset):
             gpt.load_state_dict(state, strict=False)
             self.gpt = gpt.to(self.dataset_config["device"])
             self.gpt.eval()
+
+        if "UniTalker" in self.dataset_config["a2f_model"]:
+            id_template_path = os.path.join(self.sub_dataset_config["dataset_root_path"], 'id_template.npy')
+            self.id_template_list = np.load(id_template_path)
 
     def __len__(self):
         return len(self.samples)
@@ -178,7 +183,8 @@ class UniTAFDataset(Dataset):
 
                 # 为每个chunk对创建新的样本
                 processed_item = {
-                    "speaker_id": info["speaker_id_list"][item["speaker_idx"]],  # 这里将speaker的idx转为了id
+                    "speaker_id": info["speaker_id_list"][item["speaker_idx"]],
+                    "speaker_idx": item["speaker_idx"],
                     "sample_id": item['sample_id'],
                     "pair_id": f"{chunk1_key}_{chunk2_key}",  # 添加pair_id标识
                     "chunk": new_chunk
@@ -206,7 +212,7 @@ class UniTAFDataset(Dataset):
         output = {}
         # 填入时长
         output["duration"] = second_chunk["duration"]
-        # output["speaker_id"] = second_chunk["speaker_id"]
+        output["speaker_idx"] = second_chunk["speaker_idx"]
         output["sample_id"] = sample["sample_id"]
 
         if "IndexTTS2" in self.dataset_config["tts_model"]:
@@ -275,13 +281,25 @@ class UniTAFDataset(Dataset):
         if "UniTalker" in self.dataset_config["a2f_model"]:
             '''
             获取样本中文件路径得到
+                speaker_idx 说话人idx
                 face_data 表情文件路径
+                face_template UniTalker对于表情数据的偏置量
                 face_type 表情标注类型，flame，arkit这种
                 face_fps 表情帧率
             '''
+            scale = self.sub_dataset_config["scale"]
+
             face_data = self.load_npy_array(second_chunk["face_path"])
+            face_data = self.scale_and_offset(face_data, scale, 0.0)
+            face_data = face_data.reshape(len(face_data),-1).astype(np.float32)
+
             face_type = second_chunk["face_type"]
             face_fps = second_chunk["face_fps"]
+            speaker_idx = second_chunk["speaker_idx"]
+
+            id_template = self.id_template_list[second_chunk["speaker_idx"]]
+            id_template = self.scale_and_offset(id_template, scale, 0.0)
+            id_template = id_template.reshape(1, -1).astype(np.float32)
 
             # 获取音频信息（用于对齐）
             audio_duration = second_chunk["duration"]
@@ -304,7 +322,9 @@ class UniTAFDataset(Dataset):
                     )
                     face_fps = 25
 
+            output["speaker_id"] = speaker_idx
             output["face_data"] = face_data
+            output["face_template"] = id_template
             output["face_type"] = face_type
             output["face_fps"] = face_fps
 
@@ -446,6 +466,16 @@ class UniTAFDataset(Dataset):
         print(f"[DEBUG] 重采样后形状: {resampled_data.shape}")
 
         return resampled_data
+
+    def scale_and_offset(self,
+                         data: np.ndarray,
+                         scale: float = 1.0,
+                         offset: np.ndarray = 0.0):
+        '''
+        UniTalker的一些工具方法
+        '''
+
+        return data * scale + offset
 
 
 

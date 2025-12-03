@@ -2,7 +2,9 @@
 这里实现 文本-音频-表情 联合模型的组装
 '''
 
-
+from omegaconf import OmegaConf
+import sys
+import os
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
@@ -15,16 +17,16 @@ import torch.nn as nn
 class UniTextAudioFaceModel(nn.Module):
     def __init__(
         self,
-        tts_model_name: list,
-        a2f_model_name: list,
+        cfg: Dict,
         device: torch.device,
     ):
         '''
         根据 tts_model_name 与 a2f_model_name 中模型名称来判断初始化那些模型
         '''
-        if "IndexTTS2" in tts_model_name:
-            # 初始化IndexTTS2的模型
-            from omegaconf import OmegaConf
+        self.cfg = cfg
+
+        if "IndexTTS2" in cfg["tts_model"]:
+            # 导入IndexTTS2组件
             from indextts.utils.front import TextNormalizer, TextTokenizer
 
             # 初始化文本tokenizer
@@ -37,7 +39,18 @@ class UniTextAudioFaceModel(nn.Module):
                 device=device,
             )
 
-        if "UniTalker" in self.train_config["a2f_model"]:
+        if "UniTalker" in cfg["a2f_model"]:
+            # 加载UniTalker Decoder并保存权重
+            self.a2f_model = self.build_unitalker_decoder_model(
+                cfg=cfg["UniTalker"],
+                checkpoint=Path("a2f/pretrained_models/UniTalker-L-D0-D7.pt"),
+                device=device,
+            )
+
+        if "IndexTTS2" in cfg["tts_model"] and "UniTalker" in cfg["t2f_model"]:
+            # TODO：初始化特征投影层，用于将IndexTTS2的audio feature 投影到 UniTalker decoder 的接收维度
+            self.projector =
+
 
 
 
@@ -49,6 +62,9 @@ class UniTextAudioFaceModel(nn.Module):
         base_checkpoint,
         device,
     ):
+        '''
+        这里实例化模型并加载权重
+        '''
         from indextts.gpt.model_v2 import UnifiedVoice
         # 确保模型配置中的词汇表大小与分词器的词汇表大小匹配
         vocab_size = tokenizer.vocab_size
@@ -98,7 +114,44 @@ class UniTextAudioFaceModel(nn.Module):
         if unexpected:
             print(f"[Warn] Unexpected keys during load: {unexpected}")
 
+        print(f"IndexTTS2 model:\n")
+        print(f"{model.summary()}")
+
         return model.to(device)
+
+
+    def build_unitalker_decoder_model(
+        self,
+        cfg,
+        checkpoint,
+        device,
+    ):
+        '''
+        这里实例化模型并加载权重
+        '''
+        from unitaf_train_component.unitalker_decoder_component import UniTalkerDecoder
+        from a2f.utils.utils import load_ckpt
+
+        model = UniTalkerDecoder(cfg)  # 实例化UniTalker Decoder
+        load_ckpt(model, checkpoint, re_init_decoder_and_head=False)  # 是否重新初始化decoder和head
+
+        print(f"UniTalker Decoder:\n")
+        print(f"{model.summary()}")
+
+        return model.to(device)
+
+
+
+if __name__ == '__main__':
+    """
+    测试联合模型的流程 python unitaf_train/unitaf.py
+    """
+    # 添加项目根目录到Python路径
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.dirname(current_dir)  # unitaf_train的父目录
+    sys.path.insert(0, project_root)
+
+
 
 
 
