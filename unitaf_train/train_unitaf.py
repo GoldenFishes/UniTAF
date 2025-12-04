@@ -71,6 +71,8 @@ class UniTAFTrainer():
             batch_size = text_ids.size(0)
             use_speed = torch.zeros(batch_size, dtype=torch.long, device=device)
 
+            # (1) 处理成模型输入
+
             text_inputs = self.model.tts_model.set_text_padding(text_ids.clone(), text_ids_len)
             text_inputs = F.pad(text_inputs, (0, 1), value=self.model.tts_model.stop_text_token)
             text_inputs, text_targets = self.model.tts_model.build_aligned_inputs_and_targets(
@@ -105,11 +107,15 @@ class UniTAFTrainer():
             text_emb = self.model.tts_model.text_embedding(text_inputs) + self.model.tts_model.text_pos_embedding(text_inputs)
             mel_emb = self.model.tts_model.mel_embedding(mel_inputs) + self.model.tts_model.mel_pos_embedding(mel_inputs)
 
-            # 这里是tts模型的前向过程
-            text_logits, mel_logits = self.model.tts_model.get_logits(
-                conds, text_emb, self.model.tts_model.text_head, mel_emb, self.model.tts_model.mel_head
-            )
+            # (2) IndexTTS中gpt模型的前向过程
+            text_logits, mel_logits, text_latent, mel_latent = self.model.tts_model.get_logits(
+                conds, text_emb, self.model.tts_model.text_head, mel_emb, self.model.tts_model.mel_head,
+                return_both=True  # 我们于indextts.gpt.model_v2.UnifiedVoice.get_logits()新增该return_both分支，
+                # 用于同时返回tts训练用的logits和gt_audio的latent。logits用于计算tts loss，latent用于得到后续audio feature
+            )  # 这里返回的mel_latent就是GT对应的latent
 
+
+            # (3) 根据gpt前向得到的logits计算loss
             text_mask = (
                     torch.arange(text_targets.size(1), device=device).unsqueeze(0)
                     < (text_ids_len + 1).unsqueeze(1)
@@ -143,11 +149,41 @@ class UniTAFTrainer():
             loss["tts_mel_loss"] = mel_loss
             loss["tts_metrics"] = metrics
 
-            # TODO: IndexTTS取哪里的feature？
+            # (4) 获得GT latent继续IndexTTS生成音频的过程以获取audio_feature
+            mel_latent = mel_latent[:, :-2]  # torch.Size([B, L, 1280]) 此时处理后的mel_latent与UnifiedVoice.forward()的返回一样了
 
-        # 2. TODO：获得TTS部分核心输出 处理成audio feature
+            with torch.no_grad():
+                mel_latent = self.model.s2mel.models["gpt_layer"](mel_latent)  # torch.Size([B, L, 1024])
 
-        audio_feature=
+                # # TODO: 这里会不会有没有剔除干净的只有训练时才会添加的pad残留？
+                # # TODO: 这里是否应该传入audio_codes？
+                # S_infer = self.semantic_codec.quantizer.vq2emb(audio_codes.unsqueeze(1))  # 编码转嵌入 torch.Size([B, 1024, L])
+                # S_infer = S_infer.transpose(1, 2)  # torch.Size([1, L, 1024])
+                # S_infer = S_infer + mel_latent  # 融合潜在表示 torch.Size([1, L, 1024])
+                # target_lengths = (mel_latent.shape[1] * 1.72).long()  # 计算目标长度  L*1.72
+                #
+                # # 长度调节
+                # cond = self.s2mel.models['length_regulator'](S_infer,
+                #                                              ylens=target_lengths,
+                #                                              n_quantizers=3,
+                #                                              f0=None)[0]
+                # cat_condition = torch.cat([prompt_condition, cond], dim=1)  # 拼接条件  # [1, 670, 512]
+                # # 条件流匹配推理
+                # vc_target = self.s2mel.models['cfm'].inference(cat_condition,
+                #                                                torch.LongTensor([cat_condition.size(1)]).to(
+                #                                                    cond.device),
+                #                                                ref_mel, style, None, diffusion_steps=25,
+                #                                                inference_cfg_rate=0.7)
+                # # print(f"vc_target: {vc_target.shape}")  # [1, 80, 670]
+                # vc_target = vc_target[:, :, ref_mel.size(-1):]  # 裁剪目标梅尔谱图
+
+
+        # 2. 获得TTS部分核心输出 处理成audio feature
+        if "IndexTTS2" in self.train_config["tts_model"]:
+            # TODO: 暂定使用 经过s2mel.models["gpt_layer"]处理后的 mel_latent
+            audio_feature = mel_latent  # torch.Size([B, L, 1024])
+            # 暂定不需要额外的projector层，直接训练UniTalkerDecoder中相应projector来适应即可。
+
 
         # 3. A2F Decoder接收audio feature
         if "UniTalker" in self.train_config["a2f_model"]:

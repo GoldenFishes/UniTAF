@@ -662,7 +662,7 @@ class IndexTTS2:
                         # print(f"[DEBUG] 混合后emovec: {emovec.shape}")  # torch.Size([1, 1280])
 
                     # 语音推理生成语义编码
-                    # codes相当于"音频的文本"是压缩的音频内容表示；speech_conditioning_latent相当于"说话人的声音指纹"是说话人身份的学表示
+                    # codes 为生成的目标音频的codes，但是要拿去s2mel前还得过一边gpt前向去得到latent；speech_conditioning_latent 为条件
                     codes, speech_conditioning_latent = self.gpt.inference_speech(
                         spk_cond_emb,
                         text_tokens,
@@ -716,8 +716,8 @@ class IndexTTS2:
                 code_lens = code_lens.to(self.device)
                 if verbose:
                     print(codes, type(codes))
-                    print(f"修正后的编码形状: {codes.shape}, 编码类型: {codes.dtype}")
-                    print(f"编码长度: {code_lens}")
+                    print(f"修正后的编码形状: {codes.shape}, 编码类型: {codes.dtype}")  # torch.Size([1, 304]), torch.int64
+                    print(f"编码长度: {code_lens}")  # tensor([304], device='cuda:0')
 
                 # GPT前向传播
                 m_start_time = time.perf_counter()
@@ -743,26 +743,30 @@ class IndexTTS2:
                     m_start_time = time.perf_counter()
                     diffusion_steps = 25
                     inference_cfg_rate = 0.7
+                    # print(f"--UnifiedVoice.forward()输出： {latent.shape}")  # torch.Size([1, 304, 1280])
                     latent = self.s2mel.models['gpt_layer'](latent)  # GPT层处理
-                    S_infer = self.semantic_codec.quantizer.vq2emb(codes.unsqueeze(1))  # 编码转嵌入
-                    S_infer = S_infer.transpose(1, 2)
-                    S_infer = S_infer + latent  # 融合潜在表示
-                    target_lengths = (code_lens * 1.72).long()  # 计算目标长度
+                    # print(f"--s2mel.models['gpt_layer']输出： {latent.shape}")  # torch.Size([1, 304, 1024])
+                    S_infer = self.semantic_codec.quantizer.vq2emb(codes.unsqueeze(1))  # 编码转嵌入 torch.Size([1, 1024, 304])
+                    S_infer = S_infer.transpose(1, 2)  # torch.Size([1, 304, 1024])
+                    S_infer = S_infer + latent  # 融合潜在表示 torch.Size([1, 304, 1024])
+                    target_lengths = (code_lens * 1.72).long()  # 计算目标长度  304*1.72 = 522
 
                     # 长度调节
                     cond = self.s2mel.models['length_regulator'](S_infer,
                                                                  ylens=target_lengths,
                                                                  n_quantizers=3,
                                                                  f0=None)[0]
-                    cat_condition = torch.cat([prompt_condition, cond], dim=1)  # 拼接条件
-
+                    # print(f"cond: {cond.shape}")  # [1, 522, 512]
+                    cat_condition = torch.cat([prompt_condition, cond], dim=1)  # 拼接条件  # [1, 670, 512]
                     # 条件流匹配推理
                     vc_target = self.s2mel.models['cfm'].inference(cat_condition,
                                                                    torch.LongTensor([cat_condition.size(1)]).to(
                                                                        cond.device),
                                                                    ref_mel, style, None, diffusion_steps,
                                                                    inference_cfg_rate=inference_cfg_rate)
+                    # print(f"vc_target: {vc_target.shape}")  # [1, 80, 670]
                     vc_target = vc_target[:, :, ref_mel.size(-1):]  # 裁剪目标梅尔谱图
+                    # print(f"vc_target: {vc_target.shape}")  # [1, 80, 522]
                     s2mel_time += time.perf_counter() - m_start_time
 
                     # 声码器阶段

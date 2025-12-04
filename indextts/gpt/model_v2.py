@@ -529,7 +529,11 @@ class UnifiedVoice(nn.Module):
                 text_input_tokens[b, actual_end:] = self.stop_text_token
         return text_input_tokens
 
-    def get_logits(self, speech_conditioning_inputs, first_inputs, first_head, second_inputs=None, second_head=None, get_attns=False, return_latent=False):
+    def get_logits(self, speech_conditioning_inputs, first_inputs, first_head, second_inputs=None, second_head=None, get_attns=False, return_latent=False, return_both=False):
+        '''
+        调用该方法的forward为训练过程，因为会传入second_inputs，second_inputs即为ground truth。返回的latent也是ground truth的latent。
+        '''
+
         # 拼接所有输入：参考音频条件 + 文本输入 + 音频输入（如果存在）
         if second_inputs is not None:
             emb = torch.cat([speech_conditioning_inputs, first_inputs, second_inputs], dim=1)
@@ -546,9 +550,27 @@ class UnifiedVoice(nn.Module):
         enc = gpt_out.last_hidden_state[:, offset:]  # 去掉条件部分，只保留文本和音频的隐藏状态
         enc = self.final_norm(enc)  # 应用层归一化
 
+        # 只返回latent
         if return_latent:
             return enc[:, :first_inputs.shape[1]], enc[:, -second_inputs.shape[1]:]
 
+        # [UniTextAudioFace训练新增逻辑] 同时返回latent（用于获取后续audio feature）和logits
+        if return_both:
+            # 分割输出：文本部分的logits
+            first_logits = enc[:, :first_inputs.shape[1]]
+            first_logits = first_head(first_logits)  # 文本head投影到文本词表
+            first_logits = first_logits.permute(0, 2, 1)  # 调整维度用于cross_entropy
+            if second_inputs is not None:
+                # 分割输出：音频部分的logits
+                second_logits = enc[:, -second_inputs.shape[1]:]
+                second_logits = second_head(second_logits)  # 音频head投影到音频token词表
+                second_logits = second_logits.permute(0, 2, 1)  # 调整维度用于cross_entropy  # (batch_size, sequence_length, audio_vocab_size)
+                # 返回text_logits, mel_logits, text_latent, mel_latent
+                return first_logits, second_logits, enc[:, :first_inputs.shape[1]], enc[:, -second_inputs.shape[1]:]
+            else:
+                return first_logits, enc[:, :first_inputs.shape[1]]
+
+        # 原始逻辑：只返回logits
         # 分割输出：文本部分的logits
         first_logits = enc[:, :first_inputs.shape[1]]
         first_logits = first_head(first_logits)  # 文本head投影到文本词表
@@ -690,6 +712,7 @@ class UnifiedVoice(nn.Module):
         # 获取文本和mel的logits（实际上是潜在表示）
         text_logits, mel_logits = self.get_logits(conds, text_emb, self.text_head, mel_emb, self.mel_head, get_attns=False, return_latent=True)
         # 返回mel的logits，去掉前向传播中添加的两个token
+        # 这里推理代码中mel_logits返回的实际上是 经过GPT编码 + final_norm 后的潜在表示
         return mel_logits[:, :-2]  # 尽管名字叫logits，但这些不是真正的logits / Despite the name, these are not logits. Strip off the two tokens added by this forward pass.
 
     def prepare_gpt_inputs(

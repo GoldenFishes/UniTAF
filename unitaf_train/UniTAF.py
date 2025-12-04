@@ -32,12 +32,20 @@ class UniTextAudioFaceModel(nn.Module):
             # 初始化文本tokenizer
             self.tokenizer = TextTokenizer(str("checkpoints/bpe.model"), TextNormalizer())
             cfg = OmegaConf.load(Path("checkpoints/config.yaml"))
+            # 初始化IndexTTS核心的UniVoice gpt model
             self.tts_model = self.build_indextts2_model(
                 cfg=cfg,
                 tokenizer=self.tokenizer,
                 base_checkpoint="checkpoints/gpt.pth",
                 device=device,
             )
+            # 初始化IndexTTS的s2mel model
+            self.s2mel = self.build_indextts2_s2mel(
+                cfg=cfg,
+                device=device,
+            )
+
+
 
         if "UniTalker" in cfg["a2f_model"]:
             # 加载UniTalker Decoder并保存权重
@@ -47,9 +55,6 @@ class UniTextAudioFaceModel(nn.Module):
                 device=device,
             )
 
-        if "IndexTTS2" in cfg["tts_model"] and "UniTalker" in cfg["t2f_model"]:
-            # TODO：初始化特征投影层，用于将IndexTTS2的audio feature 投影到 UniTalker decoder 的接收维度
-            self.projector =
 
 
 
@@ -63,7 +68,7 @@ class UniTextAudioFaceModel(nn.Module):
         device,
     ):
         '''
-        这里实例化模型并加载权重
+        这里实例化IndexTTS2中核心的GPT模型并加载权重
         '''
         from indextts.gpt.model_v2 import UnifiedVoice
         # 确保模型配置中的词汇表大小与分词器的词汇表大小匹配
@@ -118,6 +123,30 @@ class UniTextAudioFaceModel(nn.Module):
         print(f"{model.summary()}")
 
         return model.to(device)
+
+    def build_indextts2_s2mel(
+        self,
+        cfg,
+        device,
+    ):
+        """
+        这里初始化用于将IndexTTS核心gpt生成的semantic token转化为mel的模块，这里不需要训练该模块直接.eval
+        """
+        from indextts.s2mel.modules.commons import load_checkpoint2, MyModel
+        s2mel_path = os.path.join("checkpoints", cfg.s2mel_checkpoint)
+        s2mel = MyModel(cfg.s2mel, use_gpt_latent=True)
+        s2mel, _, _, _ = load_checkpoint2(
+            s2mel,
+            None,
+            s2mel_path,
+            load_only_params=True,
+            ignore_modules=[],
+            is_distributed=False,
+        )
+        s2mel = s2mel.to(device)
+        return s2mel.eval()
+
+
 
 
     def build_unitalker_decoder_model(
