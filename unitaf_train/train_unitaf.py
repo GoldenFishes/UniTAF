@@ -1,50 +1,135 @@
 '''
 25.12.2
 这里实现UniTextAudioFace联合模型的训练脚本
+
+UniTAFTrainer继承使用transformers Trainer类。
+- 所有的训练配置都从UniTAFTrainer.train_config中获取。
+- 数据集使用UniTAFDataset，UniTAFTrainer.setup_dataset() 已实现组装并创建合并的train/val dataset。
+- UniTAFTrainer.collate_batch() 和 UniTAFTrainer.compute_losses() 已实现相应的功能。
+- UniTAFTrainer.set_model_training_mode() 用于设置模型的训练模式
+
+- 期望实现为模型中tts模块和a2f分别应用各自的loss进行更新。故而：
+    尝试重写create_optimizer和create_scheduler为每个模块生成单独的优化器和调度器（创建配置需要根据UniTAFTrainer.train_config）
+    并在training_step()中手动完成各自反向，各自更新也由我们手动opt.step()。Trainer只负责调用 training_step，写日志，验证，保存，不会多管闲事。
+
+    Optimizer 只能看到「参数 + 参数的 .grad 字段」，它永远把当前 .grad 当成“最终梯度”去做更新。
+    如果我们想让 optimizer 自己决定用哪部分梯度”，就必须在反向之前把两份梯度拼到同一份 .grad 上。
+    这等于又回到了“先各自反传、再各自 step”的复杂度，甚至更难维护：
+        这需要分别保存tts_loss与a2f_loss到临时的buffer，把两份梯度手动写回对应参数的 .grad ,再让 optimizer 去做一次统一step；
+        同时还要处理 retain_graph=True, AMP, 梯度累积, 裁剪, zero_grad的时机。
+
+    因此在 training_step里手动各自 backward; 直接调用各自 optimizer.step();
+
 '''
 import sys
 import os
 
+from omegaconf import OmegaConf
+import argparse
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 import torch
 import torch.nn.functional as F
 from torch.optim import AdamW
-from torch.utils.data import DataLoader, ConcatDataset
+from torch.utils.data import ConcatDataset
 from transformers import get_cosine_schedule_with_warmup
 from torch.nn.utils.rnn import pad_sequence
 
-from FunASR.funasr.models.eres2net.eres2net import conv1x1
+from transformers import Trainer
+from transformers import TrainingArguments
+from transformers.trainer_pt_utils import get_parameter_names
+import wandb
+
 # UniTextAudioFace的dataset
 from unitaf_dataset import UniTAFDataset
 # 组装联合模型UniTextAudioFace的类
 from UniTAF import UniTextAudioFaceModel
 
 
-class UniTAFTrainer():
+class MultiOptimizer:
+    """包装多个优化器，使其像单个优化器一样工作"""
+    def __init__(self, optimizers):
+        self.optimizers = optimizers
+
+    def step(self):
+        """我们已经在外面 step 过了，这里什么都不做"""
+        pass
+
+    def zero_grad(self, set_to_none=True):
+        """清零所有优化器的梯度"""
+        for optimizer in self.optimizers:
+            optimizer.zero_grad(set_to_none=set_to_none)
+
+    def state_dict(self):
+        """获取所有优化器的状态"""
+        return [opt.state_dict() for opt in self.optimizers]
+
+    def load_state_dict(self, state_dicts):
+        """加载所有优化器的状态"""
+        for optimizer, state_dict in zip(self.optimizers, state_dicts):
+            optimizer.load_state_dict(state_dict)
+
+class MultiScheduler:
+    """包装多个调度器"""
+    def __init__(self, schedulers):
+        self.schedulers = schedulers
+
+    def step(self):
+        """执行所有调度器的step"""
+        # for scheduler in self.schedulers:
+        #     scheduler.step()
+        # 我们已经在training_step手工操作过了
+        pass
+
+    def get_last_lr(self):
+        """获取所有调度器的学习率"""
+        return [scheduler.get_last_lr() for scheduler in self.schedulers]
+
+    def state_dict(self):
+        """获取所有调度器的状态"""
+        return [scheduler.state_dict() for scheduler in self.schedulers]
+
+    def load_state_dict(self, state_dicts):
+        """加载所有调度器的状态"""
+        for scheduler, state_dict in zip(self.schedulers, state_dicts):
+            scheduler.load_state_dict(state_dict)
+
+class UniTAFTrainer(Trainer):
     '''
     UniTextAudioFace 训练器
+    1. 为 TTS 与 A2F 分别建立优化器 / scheduler
+    2. 重写 training_step，实现「不同模块应用各自loss 各自反向传播更新」
+    3. 兼容 AMP、梯度累积、梯度裁剪、断点保存
     '''
-    def __init__(
-        self,
-        train_config,
-    ):
+    def __init__(self, train_config, model, device, train_dataset, val_dataset):
         self.train_config = train_config
+        self.device = device
 
-        self.device = torch.device(self.train_config["device"] if torch.cuda.is_available() else "cpu")
-
-        # 初始化模型
-        self.model = UniTextAudioFaceModel(
-            cfg=train_config,
-            device=self.device,
+        super().__init__(
+            model=model,
+            train_dataset=train_dataset,
+            eval_dataset=val_dataset,
+            data_collator=self.collate_batch,  # 我们用自定义 collate_batch
+            args=TrainingArguments(
+                output_dir=train_config.get("output_dir", "./unitaf_ckpt"),
+                num_train_epochs=train_config["epochs"],
+                per_device_train_batch_size=train_config["batch_size"],
+                gradient_accumulation_steps=train_config["grad_accumulation"],
+                warmup_steps=train_config.get("warmup_steps", 50),
+                learning_rate=train_config["tts_train_cfg"]["lr"],  # 这里我们实际上后续会使用.create_optimizer()来重新构建优化器
+                fp16=train_config.get("use_amp", False),
+                logging_steps=train_config.get("log_interval", 50),
+                save_steps=train_config.get("save_interval", 1000),
+                eval_steps=train_config.get("val_interval", 500),
+                eval_strategy="steps" if train_config.get("val_interval", 0) > 0 else "no",
+                report_to=["wandb"] if train_config.get("use_wandb", True) else None,
+                remove_unused_columns=False,  # 我们自己写 collate
+                dataloader_drop_last=True,
+            )
         )
 
-
-    def compute_losses(
-        self,
-        batch,
-    ):
+    def compute_losses(self, batch):
         device = self.device
         loss = {}
         # 1. TTS部分计算出TTS核心输出
@@ -180,7 +265,7 @@ class UniTAFTrainer():
 
         # 2. 获得TTS部分核心输出 处理成audio feature
         if "IndexTTS2" in self.train_config["tts_model"]:
-            # TODO: 暂定使用 经过s2mel.models["gpt_layer"]处理后的 mel_latent
+            # 暂定使用 经过s2mel.models["gpt_layer"]处理后的 mel_latent
             audio_feature = mel_latent  # torch.Size([B, L, 1024])
             # 暂定不需要额外的projector层，直接训练UniTalkerDecoder中相应projector来适应即可。
 
@@ -212,9 +297,8 @@ class UniTAFTrainer():
 
         return loss
 
-
-
     def collate_batch(self, batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+        '''合并成tensor时需要padding为等长序列'''
         output = {}
         if "IndexTTS2" in self.train_config["tts_model"]:
             '''
@@ -227,7 +311,11 @@ class UniTAFTrainer():
             text_tensors = [item["text_ids"] for item in batch]
             code_tensors = [item["audio_codes"] for item in batch]    # 这就是GT音频的离散编码
             condition_tensors = [item["tts_condition"] for item in batch]
-            emo_tensors = [item["emo_vec"] for item in batch]
+            emo_tensors = [  # 如果遇到item["emo_vec"]为None则替换为代表clam的向量
+                item["emo_vec"] if (item.get("emo_vec") is not None)
+                else torch.tensor([0., 0., 0., 0., 0., 0., 0., 1.], dtype=torch.float32)
+                for item in batch
+            ]
 
             # 对变长序列进行填充（padding）
             text_padded = pad_sequence(text_tensors, batch_first=True, padding_value=0)
@@ -257,165 +345,289 @@ class UniTAFTrainer():
                 表情标注格式   face_type
                 表情帧率      face_fps
             '''
-            # 这里似乎不需要对UniTalker的内容做额外的计算
-            pass
+            # TODO：检查这里padding方式是否与UniTalker训练代码中一致
+            face_tensors = [item["face_data"] for item in batch]  # List[Tensor[T, C]]
+            tmpl_tensors = [item["face_template"] for item in batch]  # 等长，可 stack
+            type_tensors = [item["face_type"] for item in batch]
+            fps_tensors = [item["face_fps"] for item in batch]
+            speaker_tensors = [item["speaker_idx"] for item in batch]
 
+            # 变长维度 T 做 pad
+            face_padded = pad_sequence(face_tensors, batch_first=True, padding_value=0.0)  # [B, T_max, C]
+            # 同时返回长度
+            face_lengths = torch.tensor([f.size(0) for f in face_tensors], dtype=torch.long)
+
+            output["face_data"] = face_padded
+            output["face_data_len"] = face_lengths
+            output["face_template"] = torch.stack(tmpl_tensors, dim=0)
+            output["face_type"] = type_tensors  # 列表即可，后面用索引时再转 tensor
+            output["face_fps"] = torch.stack(fps_tensors, dim=0)
+            output["speaker_idx"] = torch.stack(speaker_tensors, dim=0)
 
         return output
 
-
-    def setup_dataloader(
-        self,
-        dataset_list: list,  # 支持多数据集训练，对应unitaf_dataset_support_config中具体数据集
-    ):
-        '''
-        初始化一个dataloader
-        在这里为每个dataset 例如"D11","D12" ;以及为每个dataset_type 例如"train","val"，都创建数据集并合并
-        最终返回总体train/val dataloader
-        '''
-        # 1. 组装dataset config
-        dataset_config = {}
-        dataset_config["tts_model"] = self.train_config["tts_model"]
-        dataset_config["a2f_model"] = self.train_config["a2f_model"]
-        dataset_config["dataset_root_path"] = self.train_config["dataset_root_path"]
-        dataset_config["device"] = self.train_config["device"]
-
-        use_cuda = torch.cuda.is_available()
-
-        train_datasets = []
-        val_datasets = []
-
-        # 2. 遍历所有子数据集
-        for subdataset in dataset_list:
-
-            try:
-                train_dataset = UniTAFDataset(dataset_config, dataset_type="train", dataset_name=subdataset)
-                train_datasets.append(train_dataset)
-            except Exception as e:
-                print(f"[UniTAFTrainer][setup_dataloader] 数据集{subdataset}没有train训练集，跳过。")
-
-            try:
-                val_dataset = UniTAFDataset(dataset_config, dataset_type="val", dataset_name=subdataset)
-                val_datasets.append(val_dataset)
-            except Exception as e:
-                print(f"[UniTAFTrainer][setup_dataloader] 数据集{subdataset}没有val验证集，跳过。")
-
-        # 3. 合并dataset
-        if len(train_datasets) > 1:
-            combined_train_dataset = ConcatDataset(train_datasets)
+    def set_model_training_mode(self):
+        """
+        设置各部分模型的训练模式
+        # TODO：部分冻结的情况
+        """
+        if self.train_config["train_tts"]:
+            # TTS部分需要训练
+            self.model.tts_model.train()
+            for param in self.model.tts_model.parameters():
+                param.requires_grad = True
         else:
-            combined_train_dataset = train_datasets[0]
+            # TTS部分不需要训练，设置为eval模式并冻结
+            self.model.tts_model.eval()
+            for param in self.model.tts_model.parameters():
+                param.requires_grad = False
 
-        if len(val_datasets) > 1:
-            combined_val_dataset = ConcatDataset(val_datasets)
+        if self.train_config["train_a2f"]:
+            # A2F部分需要训练
+            self.model.a2f_model.train()
+            for param in self.model.a2f_model.parameters():
+                param.requires_grad = True
         else:
-            combined_val_dataset = val_datasets[0]
+            # A2F部分不需要训练
+            self.model.a2f_model.eval()
+            for param in self.model.a2f_model.parameters():
+                param.requires_grad = False
 
-        # 4. 创建dataloader
-        train_dataloader = DataLoader(
-            dataset=combined_train_dataset,
-            batch_size=self.train_config["batch_size"],
-            shuffle=True,
-            num_workers=self.train_config["num_workers"],
-            collate_fn=self.collate_batch,
-            pin_memory=use_cuda,
-        )
-        val_dataloader = DataLoader(
-            dataset=combined_val_dataset,
-            batch_size=self.train_config["batch_size"],
-            shuffle=False,
-            num_workers=self.train_config["num_workers"],
-            collate_fn=self.collate_batch,
-            pin_memory=use_cuda,
-        )
+        if "IndexTTS2" in self.train_config["tts_model"]:
+            # IndexTTS2的s2mel部分始终冻结，不参与训练
+            self.model.s2mel.eval()  # 设置为eval模式
+            for param in self.model.s2mel.parameters():
+                param.requires_grad = False
+            # 确保s2mel中的子模块也冻结
+            for module in self.model.s2mel.modules():
+                if hasattr(module, 'weight'):
+                    module.weight.requires_grad = False
+                if hasattr(module, 'bias'):
+                    module.bias.requires_grad = False
 
-        return train_dataloader, val_dataloader
+    def create_optimizer(self):
+        """
+        重写optimizer创建逻辑，支持多个优化器。
+        为联合模型中tts和a2f设置独立的优化器，会在训练前调用一次。
+        """
+        if hasattr(self, "optimizer") and self.optimizer is not None:
+            return  # 已经创建过
 
+        opt_list = []
+        # ---- TTS ----
+        if self.train_config["train_a2f"]:
+            cfg = self.train_config["tts_train_cfg"]
+            params = list(self.model.tts_model.parameters())
+            opt_list.append(AdamW(params,
+                                  lr=cfg.get("lr", 2e-5),
+                                  betas=cfg.get("betas", (0.9, 0.999)),
+                                  weight_decay=cfg.get("weight_decay", 0.01),
+                                  eps=cfg.get("eps", 1e-8)))
 
-    def main(self):
-        # 根据dataset_config创建训练和验证的dataloader
-        dataset_list = self.train_config["dataset_config"]["dataset_list"]
-        train_dataloader, val_dataloader = self.setup_dataloader(dataset_list)
+        if self.train_config["train_a2f"]:
+            cfg = self.train_config["a2f_train_cfg"]
+            params = list(self.model.a2f_model.parameters())
+            opt_list.append(AdamW(params,
+                                  lr=cfg.get("lr", 2e-5),
+                                  betas=cfg.get("betas", (0.9, 0.999)),
+                                  weight_decay=cfg.get("weight_decay", 0.01),
+                                  eps=cfg.get("eps", 1e-8)))
+        self.optimizer = MultiOptimizer(opt_list)  # 将多个优化器打包成一个
 
-        # 初始化优化器
-        optimizer = AdamW(
-            self.model.parameters(),
-            lr=self.train_config["learning_rate"],
-            weight_decay=self.train_config["weight_decay"],
-        )
+    def create_scheduler(self, num_training_steps: int, optimizer=None):
+        """
+        为每个优化器创建独立的调度器，会在训练前调用一次
+        """
+        if hasattr(self, "lr_scheduler") and self.lr_scheduler is not None:
+            return
 
-        total_steps = self.train_config["epochs"] * max(1, len(train_dataloader)) // max(1, self.train_config["grad_accumulation"])
-        total_steps = max(total_steps, 1)
-        scheduler = get_cosine_schedule_with_warmup(
-            optimizer,
-            num_warmup_steps=self.train_config["warmup_steps"],
-            num_training_steps=total_steps,
-        )
-        use_amp = self.train_config["use_amp"] and self.device.type == "cuda"
-        scaler = torch.cuda.amp.GradScaler() if use_amp else None
+        schedulers = []
+        for opt in self.optimizer.optimizers:
+            # 统一用 cosine + warmup
+            sch = get_cosine_schedule_with_warmup(
+                opt,
+                num_warmup_steps=self.train_config.get("warmup_steps", 50),
+                num_training_steps=num_training_steps)
+            schedulers.append(sch)
+        self.lr_scheduler = MultiScheduler(schedulers)
 
-        global_step = 0
-        start_epoch = 0
-        recent_checkpoints: List[str] = []
-        last_saved_step: int | None = None
+    def training_step(self, model, inputs) -> torch.Tensor:
+        """
+        各自反传、各自 step，返回标量 loss 给 Trainer 做日志
+        """
+        self.set_model_training_mode()
 
-        # TODO: resume train恢复训练设置
+        # 1. 前向
+        with self.compute_loss_context_manager():
+            loss_dict = self.compute_losses(inputs)
 
-        self.model.train()  # UniTAF联合模型
-        optimizer.zero_grad(set_to_none=True)
+        # 2. 计算各子 loss
+        tts_loss = torch.tensor(0., device=self.device)
+        a2f_loss = torch.tensor(0., device=self.device)
 
-        grad_accumulation = self.train_config["grad_accumulation"]
+        if self.train_config["train_tts"]:
+            if "IndexTTS2" in self.train_config["tts_model"]:
+                tts_loss = (
+                        self.train_config["IndexTTS2"]["text_loss_weight"] * loss_dict["tts_text_loss"] +
+                        self.train_config["IndexTTS2"]["mel_loss_weight"] * loss_dict["tts_mel_loss"]
+                )
+        if self.train_config["train_a2f"]:
+            if "UniTalker" in self.train_config["a2f_model"]:
+                a2f_loss = (
+                        loss_dict["a2f_rec_loss"] +
+                        self.train_config["UniTalker"]["pca_weight"] * loss_dict["a2f_pca_loss"]
+                )
+        total_loss = tts_loss + a2f_loss / self.train_config["grad_accumulation"]
+
+        # 3. 各自反向
+        # use_last_step = (self.state.global_step + 1) % self.train_config["grad_accumulation"] == 0  # Trainer 已维护
+        # # TTS 反传
+        # if self.train_config["train_tts"] and tts_loss.item() != 0:
+        #     tts_loss.backward(retain_graph=not use_last_step)  # 只有非最后一步才保留图
+        # # A2F 反传
+        # if self.train_config["train_a2f"] and a2f_loss.item() != 0:
+        #     a2f_loss.backward(retain_graph=False)  # A2F 总是最后一段，无需保留
+
         grad_clip = self.train_config["grad_clip"]
+        use_amp = self.train_config["use_amp"] and torch.cuda.is_available()
 
-        for epoch in range(start_epoch, self.train_config["epochs"]):
-            for batch_idx, batch in enumerate(train_dataloader):
-                with torch.cuda.amp.autocast(use_amp):
-                    # 计算loss
-                    loss = self.compute_losses(batch)  # 返回一个Dict
+        # 3-a TTS 反传
+        if self.train_config["train_tts"] and tts_loss.item() != 0:
+            if use_amp:
+                with torch.cuda.amp.autocast():
+                    tts_loss.backward(retain_graph=True)
+            else:
+                tts_loss.backward(retain_graph=True)
 
+            if grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(self.model.tts_model.parameters(), grad_clip)
 
-                    if "IndexTTS2" in self.train_config["tts_model"]:
-                        tts_loss = self.train_config["IndexTTS2"]["text_loss_weight"] * loss["text_loss"] + self.train_config["IndexTTS2"]["mel_loss_weight"] * loss["mel_loss"]
-                    if "UniTalker" in self.train_config["a2f_model"]:
-                        a2f_loss = loss["a2f_rec_loss"] + self.train_config["UniTalker"]["pca_weight"] * loss["a2f_pca_loss"]
+        # 3-b A2F 反传
+        if self.train_config["train_a2f"] and a2f_loss.item() != 0:
+            if use_amp:
+                with torch.cuda.amp.autocast():
+                    a2f_loss.backward()
+            else:
+                a2f_loss.backward()
 
+            if grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(self.model.a2f_model.parameters(), grad_clip)
 
-                    # TODO: a2f loss
-                    if use_amp:
-                        scaler.scale(tts_loss / grad_accumulation).backward()
+        # 4. 各自 step（Trainer 会在外面再调一次，我们把它覆盖掉）
+        #    注意：Trainer 默认在 optimizer.step() 里会把所有优化器都 step，
+        #    所以这里我们先 step 完，把梯度清掉，后面 Trainer 再调一次时梯度为 0 就不会重复更新。
+        if self.train_config["train_tts"] and tts_loss.item() != 0:
+            opt_tts = self.optimizer.optimizers[0]
+            opt_tts.step()
+            opt_tts.zero_grad(set_to_none=True)
 
-                    else:
-                        (tts_loss / grad_accumulation).backward()
+        if self.train_config["train_a2f"] and a2f_loss.item() != 0:
+            # 当 train_tts=False 时 a2f 优化器是第 0 个
+            idx = 1 if self.train_config["train_tts"] else 0
+            opt_a2f = self.optimizer.optimizers[idx]
+            opt_a2f.step()
+            opt_a2f.zero_grad(set_to_none=True)
 
-                    # TODO:不同的loss作用于不同部分TTS/A2F
-                    if (batch_idx + 1) % grad_accumulation == 0:
-                        if grad_clip > 0:
-                            if use_amp:
-                                scaler.unscale_(optimizer)
-                            torch.nn.utils.clip_grad_norm_(self.model.tts_model.parameters(), grad_clip)
-                        if use_amp:
-                            scaler.step(optimizer)
-                            scaler.update()
-                        else:
-                            optimizer.step()
-                        scheduler.step()
-                        optimizer.zero_grad(set_to_none=True)
+        return total_loss.detach()      # 返回标量给 Trainer 做日志
 
-                        global_step += 1
+    # TODO：梯度裁剪适合用哪个？
+    def clip_gradients(self, parameters, max_norm, optimizer):
+        """ Trainer 会在 optimizer.step 前自动调用 """
+        # 这里直接调用官方实现即可
+        torch.nn.utils.clip_grad_norm_(parameters, max_norm)
 
-                        # 验证步骤
-                        if self.train_config["val_interval"] > 0 and global_step > 0 and global_step % self.train_config["val_interval"] == 0:
-                            # TODO
-                            val_metrics = self.evaluate(
-                                val_dataloader
-                            )
+    # def clip_gradients(self, optimizer, gradient_clip_val=None, gradient_clip_norm=None):
+    #     """optimizer 是 MultiOptimizer，这里对每块单独裁"""
+    #     clip_val = gradient_clip_val or self.train_config["grad_clip"]
+    #     if clip_val <= 0:
+    #         return
+    #     # 顺序与 create_optimizer 保持一致
+    #     if self.train_config["train_tts"]:
+    #         torch.nn.utils.clip_grad_norm_(self.model.tts_model.parameters(), clip_val)
+    #     if self.train_config["train_a2f"]:
+    #         torch.nn.utils.clip_grad_norm_(self.model.a2f_model.parameters(), clip_val)
 
+    def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval"):
+        """占位：只返回空 dict，后续再填具体指标"""
+        # TODO
+        return {}
 
+    def log_validation(self, metrics, step):
+        """占位：把验证指标打印出来，后续可接 wandb"""
+        # TODO
+        print(f"[Validation @ step {step}] {metrics}")
+
+def setup_dataset(train_config):  # 支持多数据集训练，对应unitaf_dataset_support_config中具体数据集
+    '''
+    在这里为每个dataset 例如"D11","D12" ;以及为每个dataset_type 例如"train","val"，都创建数据集并合并
+    最终返回总体合并后的train/val dataset
+    '''
+    # 1. 组装dataset config
+    dataset_config = {}
+    dataset_config["tts_model"] = train_config["tts_model"]
+    dataset_config["a2f_model"] = train_config["a2f_model"]
+    dataset_config["dataset_root_path"] = train_config["dataset_config"]["dataset_root_path"]
+    dataset_config["device"] = train_config["device"]
+
+    train_datasets = []
+    val_datasets = []
+
+    # 2. 遍历所有子数据集
+    for subdataset in train_config["dataset_config"]["dataset_list"]:
+        try:
+            train_dataset = UniTAFDataset(dataset_config, dataset_name=subdataset, dataset_type="train")
+            train_datasets.append(train_dataset)
+        except Exception as e:
+            print(f"[UniTAFTrainer][setup_dataloader] 数据集{subdataset}没有train训练集，跳过。\n Error:{e}")
+        try:
+            val_dataset = UniTAFDataset(dataset_config, dataset_name=subdataset, dataset_type="val")
+            val_datasets.append(val_dataset)
+        except Exception as e:
+            print(f"[UniTAFTrainer][setup_dataloader] 数据集{subdataset}没有val验证集，跳过。\n Error:{e}")
+
+    # 3. 合并dataset
+    if len(train_datasets) > 1:
+        combined_train_dataset = ConcatDataset(train_datasets)
+    else:
+        combined_train_dataset = train_datasets[0]
+    if len(val_datasets) > 1:
+        combined_val_dataset = ConcatDataset(val_datasets)
+    else:
+        combined_val_dataset = val_datasets[0]
+
+    return combined_train_dataset, combined_val_dataset
+
+def main(train_config):
+    # 1. 初始化dataset
+    train_dataset, val_dataset = setup_dataset(train_config)
+    total_steps = len(train_dataset) * train_config["epochs"] // train_config["grad_accumulation"]
+
+    # 2. 实例化模型（Trainer 需要）
+    device = torch.device(train_config["device"] if torch.cuda.is_available() else "cpu")
+    model = UniTextAudioFaceModel(cfg=train_config, device=device)
+
+    trainer = UniTAFTrainer(
+        train_config=train_config,
+        model=model,
+        device=device,
+        train_dataset=train_dataset,
+        val_dataset=val_dataset,
+    )
+
+    # 设置UniTAF实现的优化器与调度器
+    trainer.create_optimizer()
+    trainer.create_scheduler(total_steps)
+
+    # 开始训练
+    print("[UniTAFTrainer] 开始训练...")
+    trainer_stats = trainer.train()
+    print("[UniTAFTrainer] 训练结束...")
 
 
 
 if __name__ == '__main__':
     '''
+    python unitaf_train/train_unitaf.py 
     '''
     # 添加项目根目录到Python路径
     current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -426,8 +638,7 @@ if __name__ == '__main__':
         # 模型类型，这里用于指导训练器类训练哪些模型
         "tts_model": ["IndexTTS2"],
         "a2f_model": ["UniTalker"],
-
-        # 模型配置
+        # 为上面模型类型中包含的模型进行配置----------------------------------------------------------------------------------
         "IndexTTS2": {
             # TTS Loss计算时设置
             "use_duration_control": False,
@@ -447,30 +658,61 @@ if __name__ == '__main__':
             "pca_dim": 256,
             # A2F Loss计算时设置
             "pca_weight": 0.01,
+            # 以下需要参数需要根据实际情况更新：
+            "audio_encoder_feature_dim": 1024,  # 由我们选择获取的TTS中间结果Audio Feature的dim决定
+            "identity_num": 20,  # 暂定为20，实际在UniTalker Decoder权重加载时会从权重中得到这里的值并更新
         },
-
-        # 数据集类
+        # 数据集类-------------------------------------------------------------------------------------------------------
         "dataset_config": {
             "dataset_root_path": "/home/zqg/project/data/UniTAF Dataset",  # 使用绝对路径
             "dataset_list": ["D12"],  # 支持多数据集训练，对应unitaf_dataset_support_config中具体数据集
             # unitaf_dataset_support_config是经过数据集格式转换UniTAFDataset能够支持的数据集
-            # UniTalker本身还有一个 a2f/dataset/dataset_config 记录UniTalker Decoder支持的数据集
+            # （UniTalker本身还有一个 a2f/dataset/dataset_config 记录UniTalker Decoder支持的数据集，
+            # 但我们只会以 unitaf_dataset_support_config 为准）
         },
         # dataloader设置
         "num_workers": 2,
         # 设备
         "device": "cuda:0",
-        # 训练设置：
+        # 训练设置-------------------------------------------------------------------------------------------------------
         "batch_size": 2,
-        "learning_rate": 2e-5,
-        "weight_decay": 0.01,
-        "warmup_steps": 50,
-        "epochs": 10,
+        "epochs": 2,
         "grad_accumulation": 1,
         "grad_clip": 1.0,
         "use_amp": True,
-
-
-
+        "warmup_steps": 50, # 所有调度器统一参数 warmup 为50
+        "log_interval": 1,  # training_step 里打印 loss 的步长
+        "val_interval": 500,  # 每隔多少 step 做一次验证
+        "save_interval": 1000,  # 每隔多少 step 存一次 ckpt
+        "output_dir": "./unitaf_ckpt",  # 断点 & 日志保存根目录
+        "resume_path": None,  # 如需断点续训，填 ckpt 路径或 True
+        # 分别训练tts和a2f的配置
+        "train_tts": True,
+        "train_a2f": True,
+        # 优化器设置，为不同模块设置不同优化器
+        "tts_train_cfg": {
+            "lr": 2e-5,
+            "betas": (0.9, 0.999),
+            "weight_decay": 0.01,
+            "eps": 1e-08,
+        },
+        "a2f_train_cfg": {
+            "lr": 2e-5,
+            "betas": (0.9, 0.999),
+            "weight_decay": 0.01,
+            "eps": 1e-08,
+        },
+        # 日志配置：
+        "report_to": "wandb",
     }
+    train_config = OmegaConf.create(train_config)
+
+    # wandb.init(
+    #     project="UniTAF",
+    #     name=train_config.get("test UniTAF Train", None),  # 可再补一个 run_name 字段
+    #     config=OmegaConf.to_container(train_config, resolve=True),
+    #     resume="allow" if train_config.get("resume_path") else None
+    # )
+
+    main(train_config)
 

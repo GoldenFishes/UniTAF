@@ -24,7 +24,6 @@ from unitaf_dataset_support_config import unitaf_dataset_support_config
 
 
 class UniTAFDataset(Dataset):
-
     def __init__(
         self,
         dataset_config,
@@ -35,18 +34,18 @@ class UniTAFDataset(Dataset):
         self.dataset_config = dataset_config
         # 根据dataset_config["dataset"]设置的子数据集名称 如"DXX" 在dataset_support_config中获取相应sub_dataset_config
         self.sub_dataset_config = dataset_support_config[dataset_name]  # sub_dataset_config对应UniTalker中具体数据集参数配置
+        # 记录子数据集的路径
+        self.sub_dataset_path = os.path.join(
+            self.dataset_config["dataset_root_path"],
+            self.sub_dataset_config["dirname"]
+        )
+        # print("[DEBUG] prepare_dataset() 中 sub_dataset_path:", self.sub_dataset_path)
 
         # 初始化用于数据预处理的模型
         self._init_process_model()
 
         # 使用prepare_dataset方法得到提取后的数据集
         self.samples= self.prepare_dataset(dataset_type)  # List[Dict]
-        # 记录子数据集的路径
-        self.sub_dataset_path = os.path.join(
-            self.dataset_config["dataset_root_path"],
-            self.sub_dataset_config["dirname"]
-        )
-        # print("[]DEBUG prepare_dataset() 中 sub_dataset_path:", self.sub_dataset_path)
         '''
         期望从数据集中获取到的每个样本sample格式为：
         {
@@ -108,7 +107,7 @@ class UniTAFDataset(Dataset):
             self.gpt.eval()
 
         if "UniTalker" in self.dataset_config["a2f_model"]:
-            id_template_path = os.path.join(self.sub_dataset_config["dataset_root_path"], 'id_template.npy')
+            id_template_path = os.path.join(self.sub_dataset_path, 'id_template.npy')
             self.id_template_list = np.load(id_template_path)
 
     def __len__(self):
@@ -212,7 +211,7 @@ class UniTAFDataset(Dataset):
         output = {}
         # 填入时长
         output["duration"] = second_chunk["duration"]
-        output["speaker_idx"] = second_chunk["speaker_idx"]
+        output["speaker_idx"] = sample["speaker_idx"]
         output["sample_id"] = sample["sample_id"]
 
         if "IndexTTS2" in self.dataset_config["tts_model"]:
@@ -295,9 +294,9 @@ class UniTAFDataset(Dataset):
 
             face_type = second_chunk["face_type"]
             face_fps = second_chunk["face_fps"]
-            speaker_idx = second_chunk["speaker_idx"]
+            speaker_idx = sample["speaker_idx"]
 
-            id_template = self.id_template_list[second_chunk["speaker_idx"]]
+            id_template = self.id_template_list[speaker_idx]
             id_template = self.scale_and_offset(id_template, scale, 0.0)
             id_template = id_template.reshape(1, -1).astype(np.float32)
 
@@ -482,7 +481,10 @@ class UniTAFDataset(Dataset):
 
 if __name__ == '__main__':
     '''
+    测试 UniTAFDataset
     python unitaf_train/unitaf_dataset.py
+    
+    该脚本测试结果打印中collate_fn部分有误是正常的，实际训练中会以UniTAFTrainer中的collate_batch实现为准
     '''
     # 添加项目根目录到Python路径
     current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -496,8 +498,7 @@ if __name__ == '__main__':
         "tts_model": ["IndexTTS2"],
         "a2f_model": ["UniTalker"],
         # 数据集根目录
-        "dataset_root_path": "/home/zqg/project/data/UniTAF Dataset", # 使用绝对路径
-        "dataset": "D12",  # 支持多数据集训练，对应unitaf_dataset_support_config中具体数据集
+        "dataset_root_path": "/home/zqg/project/data/UniTAF Dataset",  # 使用绝对路径
         # 预处理组件所在设备
         "device": "cuda:0",
     }
@@ -508,7 +509,7 @@ if __name__ == '__main__':
     try:
         # 1. 测试数据集初始化
         print("1. 初始化数据集...")
-        dataset = UniTAFDataset(dataset_config, dataset_type="train")  # 对应{dataset_type}.json文件
+        dataset = UniTAFDataset(dataset_config, dataset_name="D12", dataset_type="train")  # 对应{dataset_type}.json文件
         print(f"✓ 数据集初始化成功")
         print(f"  数据集大小: {len(dataset)} 个样本")
         print(f"  子数据集路径: {dataset.sub_dataset_path}")
