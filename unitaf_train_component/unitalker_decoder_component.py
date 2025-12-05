@@ -5,10 +5,11 @@ from omegaconf import OmegaConf
 import os
 import sys
 
-# 添加项目根目录到Python路径
-current_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.dirname(current_dir)
-sys.path.insert(0, project_root)
+# 只在直接执行时立即添加路径
+if __name__ == "__main__":
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.dirname(current_dir)
+    sys.path.insert(0, project_root)
 
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Set, Tuple
@@ -185,10 +186,83 @@ if __name__ == '__main__':
     unitalker_decoder_config = OmegaConf.create(config)
 
     model = UniTalkerDecoder(unitalker_decoder_config)
-    # TODO: 验证权重加载无误，打印字段
     model.load_state_dict(checkpoint, strict=False)
     model.eval()
     model = model.cuda()
+
+    # 打印模型结构
+    print("=" * 80)
+    print("Model architecture:")
+    print("=" * 80)
+    print(model)
+
+    # 打印模型的所有层及其参数
+    print("\n" + "=" * 80)
+    print("Model layers and parameters:")
+    print("=" * 80)
+    for name, module in model.named_children():
+        print(f"\n{name}: {type(module).__name__}")
+
+        # 如果是ModuleDict或ModuleList，打印其内容
+        if isinstance(module, (nn.ModuleDict, nn.ModuleList)):
+            for sub_name, sub_module in module.named_children():
+                print(f"  {sub_name}: {type(sub_module).__name__}")
+                if hasattr(sub_module, 'parameters') and list(sub_module.parameters()):
+                    print(f"    Parameters: {sum(p.numel() for p in sub_module.parameters())}")
+
+    # 打印模型参数详情
+    print("\n" + "=" * 80)
+    print("Detailed parameters:")
+    print("=" * 80)
+    for name, param in model.named_parameters():
+        print(f"{name}: shape={param.shape}, dtype={param.dtype}, requires_grad={param.requires_grad}")
+
+
+    # 检查权重加载
+    print("\n" + "=" * 80)
+    print("Checking weight loading:")
+    print("=" * 80)
+    model.load_state_dict(checkpoint, strict=False)
+
+    # 比较加载的权重和模型期望的权重
+    print("\nModel state dict keys:")
+    model_keys = set(model.state_dict().keys())
+    print(f"Total keys in model: {len(model_keys)}")
+
+    # print("\nCheckpoint keys:")
+    checkpoint_keys = set(checkpoint.keys())
+    # print(f"Total keys in checkpoint: {len(checkpoint_keys)}")
+
+    # 打印权重期望key时排除 audio_encoder
+    print("\nMissing keys in checkpoint (model has but checkpoint doesn't):")
+    missing = model_keys - checkpoint_keys
+    missing_filtered = [key for key in sorted(missing) if 'audio_encoder' not in key]
+    for key in missing_filtered:
+        print(f"  - {key}")
+
+    print("\nUnexpected keys in checkpoint (checkpoint has but model doesn't):")
+    unexpected = checkpoint_keys - model_keys
+    unexpected_filtered = [key for key in sorted(unexpected) if 'audio_encoder' not in key]
+    for key in unexpected_filtered:
+        print(f"  - {key}")
+
+    # 打印加载的权重形状
+    print("\n" + "=" * 80)
+    print("Loaded weights shapes (filtered):")
+    print("=" * 80)
+    for key in sorted(checkpoint.keys()):
+        # 跳过 audio_encoder 相关的键
+        if 'audio_encoder' in key:
+            continue
+
+        if key in model.state_dict():
+            model_shape = model.state_dict()[key].shape
+            checkpoint_shape = checkpoint[key].shape
+            match = "✓" if model_shape == checkpoint_shape else "✗"
+            print(f"{match} {key}: model={model_shape}, checkpoint={checkpoint_shape}")
+        else:
+            print(f"✗ {key}: not in model, shape={checkpoint[key].shape}")
+
 
 
     # 构造输入
