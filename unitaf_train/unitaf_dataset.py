@@ -17,6 +17,7 @@ import torchaudio
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import Dataset
 
 # 导入unitaf项目支持的数据集字典
@@ -80,31 +81,53 @@ class UniTAFDataset(Dataset):
             from unitaf_train_component.indextts2_train_component import SemanticExtractor
             from indextts.utils.maskgct_utils import build_semantic_codec, build_semantic_model
             from huggingface_hub import hf_hub_download
+            from indextts.s2mel.modules.campplus.DTDNN import CAMPPlus
             import safetensors.torch
 
             # config来源于index-tts/checkpoints/config.yaml
             indextts2_cfg = OmegaConf.load(Path("checkpoints/config.yaml"))
 
+            # 文本tokenizer
             self.tokenizer = TextTokenizer(
                 str(Path("checkpoints/bpe.model")),
                 TextNormalizer(),
             )
 
+            # 音频的语义特征提取器
             stats_path = Path("checkpoints/wav2vec2bert_stats.pt")
             self.semantic_extractor = SemanticExtractor(stats_path, self.dataset_config["device"])
 
+            # 音频的语义编码器
             self.semantic_codec = build_semantic_codec(indextts2_cfg.semantic_codec)
             semantic_code_ckpt = hf_hub_download("amphion/MaskGCT", filename="semantic_codec/model.safetensors")
             safetensors.torch.load_model(self.semantic_codec, semantic_code_ckpt)
             self.semantic_codec = self.semantic_codec.to(self.dataset_config["device"])
             self.semantic_codec.eval()
 
+            # IndexTTS2中核心自回归Transformer的封装模型UnifiedVoice
             gpt = UnifiedVoice(**indextts2_cfg.gpt)
             ckpt = torch.load("checkpoints/gpt.pth", map_location="cpu")
             state = ckpt.get("model", ckpt)
             gpt.load_state_dict(state, strict=False)
             self.gpt = gpt.to(self.dataset_config["device"])
             self.gpt.eval()
+
+            # 加载情感和说话人矩阵
+            self.emo_num = list(indextts2_cfg.emo_num)  # 每种情感的数量
+            emo_matrix = torch.load(os.path.join("checkpoints", indextts2_cfg.emo_matrix))
+            self.emo_matrix = emo_matrix.to(self.dataset_config["device"])
+            spk_matrix = torch.load(os.path.join("checkpoints", indextts2_cfg.spk_matrix))
+            self.spk_matrix = spk_matrix.to(self.dataset_config["device"])
+            # 按情感类型分割矩阵
+            self.emo_matrix = torch.split(self.emo_matrix, self.emo_num)
+            self.spk_matrix = torch.split(self.spk_matrix, self.emo_num)
+
+            # 加载说话人识别模型（CAMPPlus）
+            campplus_ckpt_path = hf_hub_download("funasr/campplus", filename="campplus_cn_common.bin")
+            campplus_model = CAMPPlus(feat_dim=80, embedding_size=192)
+            campplus_model.load_state_dict(torch.load(campplus_ckpt_path, map_location="cpu"))
+            self.campplus_model = campplus_model.to(self.dataset_config["device"])
+            self.campplus_model.eval()
 
         if "UniTalker" in self.dataset_config["a2f_model"]:
             id_template_path = os.path.join(self.sub_dataset_path, 'id_template.npy')
@@ -114,6 +137,9 @@ class UniTAFDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx: int):
+        '''
+        UniTAFDataset.__getitem__()实际上从samples中调用prepare_model_input()方法处理
+        '''
         if isinstance(idx, (list, np.ndarray)):
             return [self._get_single_item(i) for i in idx]  # 批量获取：返回样本列表
         else:
@@ -126,6 +152,22 @@ class UniTAFDataset(Dataset):
         try:
             # 使用prepare_model_input
             dataset_sample = self.prepare_model_input(sample)
+            # 打印调试信息，检查sample中所有字段的类型与shape
+            def _print(k: str, v: Any, indent: int = 0):
+                pad = " " * indent
+                if isinstance(v, torch.Tensor):
+                    print(
+                        f"{pad}[UniTAFDataset]  idx={idx:>5}  {k:<30}  Tensor  dtype={str(v.dtype):<8}  shape={tuple(v.shape)}")
+                elif isinstance(v, dict):
+                    print(f"{pad}[UniTAFDataset]  idx={idx:>5}  {k:<30}  dict (len={len(v)})")
+                    for kk, vv in v.items():
+                        _print(f"{k}.{kk}", vv, indent + 4)
+                else:
+                    print(f"{pad}[UniTAFDataset]  idx={idx:>5}  {k:<30}  {type(v).__name__}  value={v}")
+            # # 逐字段打印
+            # for k, v in sample.items():
+            #     _print(k, v)
+
             return dataset_sample
 
         except Exception as e:
@@ -196,7 +238,8 @@ class UniTAFDataset(Dataset):
     # 根据sample中的文件路径，预处理成模型的直接输入
     def prepare_model_input(self, sample):
         """
-        将获取到的sample处理成模型的直接输入
+        将获取到的sample处理成模型的直接输入，
+        这里处理好返回的model_input需要是tensor
         """
         # 分别获得sample中的前一个和后一个chunk，前一个一般当作参考条件，后一个当作生成目标
         chunks = sample["chunk"]
@@ -211,7 +254,7 @@ class UniTAFDataset(Dataset):
         output = {}
         # 填入时长
         output["duration"] = second_chunk["duration"]
-        output["speaker_idx"] = sample["speaker_idx"]
+        output["speaker_idx"] = torch.tensor(sample["speaker_idx"], dtype=torch.long)  # 后面组batch需要使用，所以在这里转tensor
         output["sample_id"] = sample["sample_id"]
 
         if "IndexTTS2" in self.dataset_config["tts_model"]:
@@ -257,25 +300,51 @@ class UniTAFDataset(Dataset):
                 conditioning = self.gpt.get_conditioning(
                     cond_feat.transpose(1, 2), cond_lengths.to(cond_feat.device)
                 )
+                conditioning = conditioning.squeeze(0)
+                # print("[DEBUG] conditioning:", conditioning.shape)  # torch.Size([32, 1280])
 
+                # 提取情感向量：使用GPT模型获取情感特征
+                emo_vec = self.gpt.get_emovec(gt_feat, gt_lengths.to(gt_feat.device))
                 # 如果数据集中有情感向量
                 if second_chunk.get("text_emotion_vector", None) is not None:
-                    emo_vec = second_chunk["text_emotion_vector"]
-                else:
-                    # 提取情感向量：使用GPT模型获取情感特征
-                    emo_vec = self.gpt.get_emovec(gt_feat, gt_lengths.to(gt_feat.device))
+                    weight_vector = torch.tensor(second_chunk["text_emotion_vector"], device=emo_vec.device)
+                    # 提取说话人风格特征
+                    audio_16k = torchaudio.transforms.Resample(st_sr, 16000)(gt_waveform)  # 重采样到16kHz
+                    feat = torchaudio.compliance.kaldi.fbank(audio_16k.to(cond_feat.device), num_mel_bins=80, dither=0, sample_frequency=16000)
+                    feat = feat - feat.mean(dim=0, keepdim=True)  # feat2另外一个滤波器能量组特征[L, 80]
+                    style = self.campplus_model(feat.unsqueeze(0))  # torch.Size([1, 192])
+                    # 基于余弦相似度选择最相似的情感
+                    random_index = [self.find_most_similar_cosine(style, tmp) for tmp in self.spk_matrix]
+                    # 构建情感矩阵
+                    emo_matrix = [tmp[index].unsqueeze(0) for index, tmp in zip(random_index, self.emo_matrix)]
+                    emo_matrix = torch.cat(emo_matrix, 0)  # torch.Size([8, 1280])
+                    emovec_mat = weight_vector.unsqueeze(1) * emo_matrix  # 加权情感矩阵 torch.Size([1280])
+                    emovec_mat = torch.sum(emovec_mat, 0).unsqueeze(0)  # 求和得到最终情感向量  torch.Size([1, 1280])
+                    # 将数据集提供的情感向量 emovec_mat 与原本音频的emo_vec 进行混合
+                    emo_vec = emovec_mat +  (1 - torch.sum(weight_vector)) * emo_vec  # torch.Size([1, 1280])
+
+                emo_vec = emo_vec.cpu().numpy().astype(np.float32).squeeze(0)
+                # print("[DEBUG] emo_vec:", emo_vec.shape)  # emo_vec: (1280,)
 
             # 条件音频
-            output["tts_condition"] = conditioning
-            output["tts_condition_len"] = cond_lengths
+            output["tts_condition"] = torch.as_tensor(conditioning, dtype=torch.float)  # torch.Size([32, 1280])
+            output["tts_condition_len"] = torch.as_tensor(cond_lengths.item(), dtype=torch.long)  # torch.Size([])
             # 文本token
-            output["text_ids"] = text_ids
-            output["text_ids_len"] = torch.tensor(len(text_ids), dtype=torch.long)
+            output["text_ids"] = torch.as_tensor(text_ids, dtype=torch.long)  # (L)
+            output["text_ids_len"] = torch.tensor(len(text_ids), dtype=torch.long)  # torch.Size([])
             # GT音频
-            output["audio_codes"] = gt_semantic_code
-            output["audio_codes_len"] = gt_lengths
+            output["audio_codes"] = torch.as_tensor(gt_semantic_code, dtype=torch.long)  # (L)
+            output["audio_codes_len"] = torch.as_tensor(gt_lengths.item(), dtype=torch.long)  # torch.Size([])
             # 情感向量
-            output["emotion_vector"] = emo_vec
+            output["emotion_vector"] = torch.as_tensor(emo_vec, dtype=torch.float)  # torch.Size([1280])
+
+            # print(f"[prepare_model_input] tts_condition: {output['tts_condition'].shape}")
+            # print(f"[prepare_model_input] tts_condition_len: {output['tts_condition_len'].shape}")
+            # print(f"[prepare_model_input] text_ids: {output['text_ids'].shape}")
+            # print(f"[prepare_model_input] text_ids_len: {output['text_ids_len'].shape}")
+            # print(f"[prepare_model_input] audio_codes: {output['audio_codes'].shape}")
+            # print(f"[prepare_model_input] audio_codes_len: {output['audio_codes_len'].shape}")
+            # print(f"[prepare_model_input] emotion_vector: {output['emotion_vector'].shape}")
 
         if "UniTalker" in self.dataset_config["a2f_model"]:
             '''
@@ -321,11 +390,11 @@ class UniTAFDataset(Dataset):
                     )
                     face_fps = 25
 
-            output["speaker_id"] = speaker_idx
-            output["face_data"] = face_data
-            output["face_template"] = id_template
+            output["speaker_id"] = torch.as_tensor(speaker_idx, dtype=torch.long)
+            output["face_data"] = torch.as_tensor(face_data, dtype=torch.float)
+            output["face_template"] = torch.as_tensor(id_template, dtype=torch.float)
             output["face_type"] = face_type
-            output["face_fps"] = face_fps
+            output["face_fps"] = torch.as_tensor(face_fps, dtype=torch.float)
 
         return output
 
@@ -421,8 +490,8 @@ class UniTAFDataset(Dataset):
             # 根据帧数计算持续时间
             duration = len(face_data) / source_fps
 
-        print(f"[DEBUG] 面部数据重采样: {source_fps}FPS -> {target_fps}FPS, 时长: {duration:.2f}秒")
-        print(f"[DEBUG] 原始数据形状: {face_data.shape}")
+        # print(f"[UniTAFDataset][resample_face_data_] 面部数据重采样: {source_fps}FPS -> {target_fps}FPS, 时长: {duration:.2f}秒")
+        # print(f"[UniTAFDataset][resample_face_data_] 原始数据形状: {face_data.shape}")
 
         # 创建原始时间轴（秒）
         original_time = np.linspace(0, duration, len(face_data))
@@ -462,21 +531,29 @@ class UniTAFDataset(Dataset):
         if num_features == 1:
             resampled_data = resampled_data.flatten()
 
-        print(f"[DEBUG] 重采样后形状: {resampled_data.shape}")
+        # print(f"[UniTAFDataset][resample_face_data_] 重采样后形状: {resampled_data.shape}")
 
         return resampled_data
 
-    def scale_and_offset(self,
-                         data: np.ndarray,
-                         scale: float = 1.0,
-                         offset: np.ndarray = 0.0):
+    def scale_and_offset(self, data: np.ndarray, scale: float = 1.0, offset: np.ndarray = 0.0):
         '''
         UniTalker的一些工具方法
         '''
 
         return data * scale + offset
 
+    def find_most_similar_cosine(self, query_vector, matrix):
+        """
+        使用余弦相似度在矩阵中查找与查询向量最相似的向量。 用于在IndexTTS情感向量混合中使用
+        """
+        query_vector = query_vector.float()  # 确保为float类型
+        matrix = matrix.float()  # 确保为float类型
 
+        # 计算余弦相似度 [num_vectors]
+        similarities = F.cosine_similarity(query_vector, matrix, dim=1)
+        # 找到相似度最高的索引
+        most_similar_index = torch.argmax(similarities)
+        return most_similar_index
 
 
 if __name__ == '__main__':

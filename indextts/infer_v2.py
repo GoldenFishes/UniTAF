@@ -555,10 +555,10 @@ class IndexTTS2:
 
             # 构建情感矩阵
             emo_matrix = [tmp[index].unsqueeze(0) for index, tmp in zip(random_index, self.emo_matrix)]
-            emo_matrix = torch.cat(emo_matrix, 0)
-            emovec_mat = weight_vector.unsqueeze(1) * emo_matrix  # 加权情感矩阵
-            emovec_mat = torch.sum(emovec_mat, 0)  # 求和得到最终情感向量
-            emovec_mat = emovec_mat.unsqueeze(0)   # 添加批次维度
+            emo_matrix = torch.cat(emo_matrix, 0)  # torch.Size([8, 1280])
+            emovec_mat = weight_vector.unsqueeze(1) * emo_matrix  # 加权情感矩阵 torch.Size([8, 1280])
+            emovec_mat = torch.sum(emovec_mat, 0)  # 求和得到最终情感向量 torch.Size([1280])
+            emovec_mat = emovec_mat.unsqueeze(0)   # 添加批次维度 torch.Size([1, 1280])
 
         # 情感条件缓存处理
         if self.cache_emo_cond is None or self.cache_emo_audio_prompt != emo_audio_prompt:
@@ -657,7 +657,7 @@ class IndexTTS2:
 
                     # 如果提供了情感向量，进行混合
                     if emo_vector is not None:
-                        emovec = emovec_mat + (1 - torch.sum(weight_vector)) * emovec
+                        emovec = emovec_mat + (1 - torch.sum(weight_vector)) * emovec  # torch.Size([1, 1280])
                         # emovec = emovec_mat
                         # print(f"[DEBUG] 混合后emovec: {emovec.shape}")  # torch.Size([1, 1280])
 

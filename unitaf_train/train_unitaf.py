@@ -24,6 +24,28 @@ UniTAFTrainer继承使用transformers Trainer类。
 import sys
 import os
 
+# 添加项目根目录到Python路径
+current_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.dirname(current_dir)  # unitaf_train的父目录
+sys.path.insert(0, project_root)
+
+# ----进行包修复----
+# chumpy 最后一次更新停留在 2018 年，内部用了 Python 3 已废弃的 inspect.getargspec，在 Python≥3.11 会报：
+# AttributeError: module 'inspect' has no attribute 'getargspec'
+import inspect
+inspect.getargspec = inspect.getfullargspec  # 这里临时补丁修复，否则会影响UniTalker Loss计算
+# 防止 chumpy 用旧的用法时尝试报错
+import numpy as np
+# 重建被删的别名
+np.bool = bool
+np.int = int
+np.float = float
+np.complex = complex
+np.object = object
+np.str = str
+np.unicode = str
+# -----------------
+
 from omegaconf import OmegaConf
 import argparse
 from pathlib import Path
@@ -126,11 +148,12 @@ class UniTAFTrainer(Trainer):
                 report_to=["wandb"] if train_config.get("use_wandb", True) else None,
                 remove_unused_columns=False,  # 我们自己写 collate
                 dataloader_drop_last=True,
+                dataloader_pin_memory=False,  # 关闭。 pin_memory 只能对CPU Tensor操作，我们在dataset、collate等多个阶段均有将张量移到GPU中。
             )
         )
 
     def compute_losses(self, batch):
-        device = self.device
+        device = next(self.model.parameters()).device   # 真实设备 而非指定self.device, 因为实际运行时Trainer 会按 accelerate 策略重新分配设备
         loss = {}
         # 1. TTS部分计算出TTS核心输出
         if "IndexTTS2" in self.train_config["tts_model"]:
@@ -149,7 +172,7 @@ class UniTAFTrainer(Trainer):
             tts_condition = batch["tts_condition"].to(device)
             text_ids = batch["text_ids"].to(device)
             audio_codes = batch["audio_codes"].to(device)
-            emo_vec = batch["emo_vec"].to(device)
+            emo_vec = batch["emotion_vector"].to(device)
             text_ids_len = batch["text_ids_len"].to(device)
             audio_codes_len = batch["audio_codes_len"].to(device)
 
@@ -187,7 +210,7 @@ class UniTAFTrainer(Trainer):
             conds = torch.cat(
                 (tts_condition + emo_vec.unsqueeze(1), duration_ctrl.unsqueeze(1), duration_free.unsqueeze(1)),
                 dim=1,
-            )
+            )  # tts_condition (B, 32, 1280) 与 emo_vec (B, 1, 1280)
 
             text_emb = self.model.tts_model.text_embedding(text_inputs) + self.model.tts_model.text_pos_embedding(text_inputs)
             mel_emb = self.model.tts_model.mel_embedding(mel_inputs) + self.model.tts_model.mel_pos_embedding(mel_inputs)
@@ -311,11 +334,7 @@ class UniTAFTrainer(Trainer):
             text_tensors = [item["text_ids"] for item in batch]
             code_tensors = [item["audio_codes"] for item in batch]    # 这就是GT音频的离散编码
             condition_tensors = [item["tts_condition"] for item in batch]
-            emo_tensors = [  # 如果遇到item["emo_vec"]为None则替换为代表clam的向量
-                item["emo_vec"] if (item.get("emo_vec") is not None)
-                else torch.tensor([0., 0., 0., 0., 0., 0., 0., 1.], dtype=torch.float32)
-                for item in batch
-            ]
+            emo_tensors = [item["emotion_vector"] for item in batch]
 
             # 对变长序列进行填充（padding）
             text_padded = pad_sequence(text_tensors, batch_first=True, padding_value=0)
@@ -328,13 +347,21 @@ class UniTAFTrainer(Trainer):
             code_lengths = torch.stack([item["audio_codes_len"] for item in batch])
             cond_lengths = torch.stack([item["tts_condition_len"] for item in batch])
 
-            output["tts_condition"] = condition_stacked
-            output["tts_condition_len"] = cond_lengths
-            output["text_ids"] = text_padded
-            output["text_ids_len"] = text_lengths
-            output["audio_codes"] = code_padded
-            output["audio_codes_len"] = code_lengths
-            output["emotion_vector"] = emo_stacked
+            output["tts_condition"] = condition_stacked  # (B, 32, 1280)
+            output["tts_condition_len"] = cond_lengths  # (B)
+            output["text_ids"] = text_padded  # (B, L)
+            output["text_ids_len"] = text_lengths  # (B)
+            output["audio_codes"] = code_padded  # (B, L)
+            output["audio_codes_len"] = code_lengths  # (B)
+            output["emotion_vector"] = emo_stacked  # (B, 1280)
+
+            # print(f"[collate_batch] tts_condition: {condition_stacked.shape} ")
+            # print(f"[collate_batch] tts_condition_len: {cond_lengths.shape}")
+            # print(f"[collate_batch] text_ids: {text_padded.shape}")
+            # print(f"[collate_batch] text_ids_len: {text_lengths.shape}")
+            # print(f"[collate_batch] audio_codes: {code_padded.shape}")
+            # print(f"[collate_batch] audio_codes_len: {code_lengths.shape}")
+            # print(f"[collate_batch] emotion_vector: {emo_stacked.shape}")
 
         if "UniTalker" in self.train_config["a2f_model"]:
             '''
@@ -398,12 +425,7 @@ class UniTAFTrainer(Trainer):
             self.model.s2mel.eval()  # 设置为eval模式
             for param in self.model.s2mel.parameters():
                 param.requires_grad = False
-            # 确保s2mel中的子模块也冻结
-            for module in self.model.s2mel.modules():
-                if hasattr(module, 'weight'):
-                    module.weight.requires_grad = False
-                if hasattr(module, 'bias'):
-                    module.bias.requires_grad = False
+            # TODO:如何确保s2mel中每个子模块都真正冻结了？
 
     def create_optimizer(self):
         """
@@ -451,10 +473,18 @@ class UniTAFTrainer(Trainer):
             schedulers.append(sch)
         self.lr_scheduler = MultiScheduler(schedulers)
 
-    def training_step(self, model, inputs) -> torch.Tensor:
+    def training_step(self, model, inputs, num_items_in_batch=None) -> torch.Tensor:
         """
         各自反传、各自 step，返回标量 loss 给 Trainer 做日志
+
+        这里不会用到Trainer传入的num_items_in_batch。
         """
+        # print(f"[training_step] model type={type(model).__name__}")  # type=DataParallel
+        # print(f"[training_step] model class={model.__class__}")  # class=<class 'torch.nn.parallel.data_parallel.DataParallel'>
+        # # 是不是被 accelerate 包过： 是
+        # if hasattr(model, "module"):
+        #     print(f"[training_step] model has .module -> wrapped by DistributedDataParallel / accelerate")
+
         self.set_model_training_mode()
 
         # 1. 前向
@@ -629,10 +659,6 @@ if __name__ == '__main__':
     '''
     python unitaf_train/train_unitaf.py 
     '''
-    # 添加项目根目录到Python路径
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    project_root = os.path.dirname(current_dir)  # unitaf_train的父目录
-    sys.path.insert(0, project_root)
 
     train_config = {
         # 模型类型，这里用于指导训练器类训练哪些模型
@@ -673,7 +699,7 @@ if __name__ == '__main__':
         # dataloader设置
         "num_workers": 2,
         # 设备
-        "device": "cuda:0",
+        "device": "cuda:1",
         # 训练设置-------------------------------------------------------------------------------------------------------
         "batch_size": 2,
         "epochs": 2,

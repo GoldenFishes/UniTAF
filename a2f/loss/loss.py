@@ -310,19 +310,19 @@ class UniTalkerLoss(nn.Module):
                 'class': FlameParamLossForDADHead,
                 'args': {
                     'mouth_indices_path':
-                    'resources/binary_resources/02_flame_mouth_idx.npy',
+                    'a2f/resources/binary_resources/02_flame_mouth_idx.npy',
                     'loss_mask_path':
-                    'resources/binary_resources/flame_humanface_index.npy',
-                    'flame_model_path': 'resources/binary_resources/flame.pkl',
+                    'a2f/resources/binary_resources/flame_humanface_index.npy',
+                    'flame_model_path': 'a2f/resources/binary_resources/flame.pkl',
                 }
             },
             '3DETF_blendshape_weight': {
                 'class': BlendShapeLoss,
                 'args': {
                     'mouth_indices_path':
-                    'resources/binary_resources/03_emo_talk_mouth_idx.npy',
+                    'a2f/resources/binary_resources/03_emo_talk_mouth_idx.npy',
                     'blendshape_path':
-                    'resources/binary_resources/EmoTalk.npz',
+                    'a2f/resources/binary_resources/EmoTalk.npz',
                     'bs_beta': args.blendshape_weight,
                 },
             },
@@ -330,9 +330,9 @@ class UniTalkerLoss(nn.Module):
                 'class': BlendShapeLoss,
                 'args': {
                     'mouth_indices_path':
-                    'resources/binary_resources/05_inhouse_arkit_mouth_idx.npy',
+                    'a2f/resources/binary_resources/05_inhouse_arkit_mouth_idx.npy',
                     'blendshape_path':
-                    'resources/binary_resources/inhouse_arkit.npz',
+                    'a2f/resources/binary_resources/inhouse_arkit.npz',
                     'bs_beta': args.blendshape_weight,
                 },
             },
@@ -340,28 +340,28 @@ class UniTalkerLoss(nn.Module):
                 'class': VerticesLoss,
                 'args': {
                     'mouth_indices_path':
-                    'resources/binary_resources/02_flame_mouth_idx.npy',
+                    'a2f/resources/binary_resources/02_flame_mouth_idx.npy',
                 },
             },
             'BIWI_23370_vertices': {
                 'class': VerticesLoss,
                 'args': {
                     'mouth_indices_path':
-                    'resources/binary_resources/04_BIWI_mouth_idx.npy',
+                    'a2f/resources/binary_resources/04_BIWI_mouth_idx.npy',
                 },
             },
             'FLAME_SUB_2055_vertices': {
                 'class': VerticesLoss,
                 'args': {
                     'mouth_indices_path':
-                    'resources/binary_resources/mouth_idx_FLAME_5023_vertices_wo_eyes_wo_head.npy',
+                    'a2f/resources/binary_resources/mouth_idx_FLAME_5023_vertices_wo_eyes_wo_head.npy',
                 },
             },
             'meshtalk_6172_vertices': {
                 'class': VerticesLoss,
                 'args': {
                     'mouth_indices_path':
-                    'resources/binary_resources/06_mesh_talk_mouth_idx.npy',
+                    'a2f/resources/binary_resources/06_mesh_talk_mouth_idx.npy',
                 },
             },
             '24_viseme': {
