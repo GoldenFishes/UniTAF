@@ -172,6 +172,7 @@ class UniTAFTrainer(Trainer):
             tts_condition = batch["tts_condition"].to(device)
             text_ids = batch["text_ids"].to(device)
             audio_codes = batch["audio_codes"].to(device)
+            # print("[compute loss] audio_codes", audio_codes.shape)  # torch.Size([16, 479])
             emo_vec = batch["emotion_vector"].to(device)
             text_ids_len = batch["text_ids_len"].to(device)
             audio_codes_len = batch["audio_codes_len"].to(device)
@@ -259,9 +260,11 @@ class UniTAFTrainer(Trainer):
 
             # (4) 获得GT latent继续IndexTTS生成音频的过程以获取audio_feature
             mel_latent = mel_latent[:, :-2]  # torch.Size([B, L, 1280]) 此时处理后的mel_latent与UnifiedVoice.forward()的返回一样了
+            # print("[compute loss] mel_latent", mel_latent.shape)  # torch.Size([16, 479, 1280])
 
             with torch.no_grad():
                 mel_latent = self.model.s2mel.models["gpt_layer"](mel_latent)  # torch.Size([B, L, 1024])
+            # print("[compute loss] mel_latent after gpt_layer", mel_latent.shape)  # torch.Size([16, 479, 1024])
 
                 # # TODO: 这里会不会有没有剔除干净的只有训练时才会添加的pad残留？
                 # # TODO: 这里是否应该传入audio_codes？
@@ -285,12 +288,21 @@ class UniTAFTrainer(Trainer):
                 # # print(f"vc_target: {vc_target.shape}")  # [1, 80, 670]
                 # vc_target = vc_target[:, :, ref_mel.size(-1):]  # 裁剪目标梅尔谱图
 
-
-        # 2. 获得TTS部分核心输出 处理成audio feature
+        # 2. 获得TTS部分核心输出 处理audio feature
         if "IndexTTS2" in self.train_config["tts_model"]:
-            # 暂定使用 经过s2mel.models["gpt_layer"]处理后的 mel_latent
+            '''
+            在IndexTTS2 24000 (24K)音频采样率下, 实际产生的token数为 T(秒) * 50 -1, 可以几乎认为是50个token表示一秒.
+            而UniTalker Decoder我们设置帧率为25fps.
+            
+            因此我们在porjector层只需要将获取的音频长度padding一个token后, 降采样到1/2即可与GT Face Data的25fps 同步
+            '''
+            # (1) 暂定使用 经过s2mel.models["gpt_layer"]处理后的 mel_latent
             audio_feature = mel_latent  # torch.Size([B, L, 1024])
-            # 暂定不需要额外的projector层，直接训练UniTalkerDecoder中相应projector来适应即可。
+
+            # (2) 为audio_feature的长度 L 增加 1. (B, L, 1024) -> (B, L+1, 1024), 以便正好被整每秒50个token数整除
+            # 使用额外的projector层，将长度降采样到1/2， (B, L+1, 1024) -> (B, (L+1)/2, 1024)
+            audio_feature = self.model.audio_feature_projector(audio_feature)
+            # print("[compute loss] audio_feature.shape", audio_feature.shape)  # torch.Size([16, 240, 1024])
 
 
         # 3. A2F Decoder接收audio feature
@@ -312,6 +324,8 @@ class UniTAFTrainer(Trainer):
                 audio_feature=audio_feature, template=face_template, face_motion=face_data,
                 style_idx=identity ,annot_type=face_type,
             )
+
+            # TODO:计算loss的时候带上batch["face_data_len"]来生成有效部分的mask
             # 由我们单独实现的unitalker_decoder_component.UniTalkerDecoder.compute_loss()中计算loss
             rec_loss, pca_loss = self.model.a2f_model.compute_loss(out_motion, face_data, face_type, out_pca, gt_pca)
 
@@ -384,8 +398,8 @@ class UniTAFTrainer(Trainer):
             # 同时返回长度
             face_lengths = torch.tensor([f.size(0) for f in face_tensors], dtype=torch.long)
 
-            output["face_data"] = face_padded
-            output["face_data_len"] = face_lengths
+            output["face_data"] = face_padded  # padding后的face data
+            output["face_data_len"] = face_lengths  # face data 有效长度
             output["face_template"] = torch.stack(tmpl_tensors, dim=0)
             output["face_type"] = type_tensors  # 列表即可，后面用索引时再转 tensor
             output["face_fps"] = torch.stack(fps_tensors, dim=0)
@@ -395,7 +409,8 @@ class UniTAFTrainer(Trainer):
 
     def set_model_training_mode(self):
         """
-        设置各部分模型的训练模式
+        设置各部分模型的训练模式，
+        固定包含tts_model，a2f_model 可能包含 audio_feature_projector 与 tts的后续波形生成模块
         # TODO：部分冻结的情况
         """
         if self.train_config["train_tts"]:
@@ -414,11 +429,21 @@ class UniTAFTrainer(Trainer):
             self.model.a2f_model.train()
             for param in self.model.a2f_model.parameters():
                 param.requires_grad = True
+            # 若同时存在音频特征投影层，也同步打开
+            if hasattr(self.model, 'audio_feature_projector'):
+                self.model.audio_feature_projector.train()
+                for param in self.model.audio_feature_projector.parameters():
+                    param.requires_grad = True
         else:
             # A2F部分不需要训练
             self.model.a2f_model.eval()
             for param in self.model.a2f_model.parameters():
                 param.requires_grad = False
+            # 若同时存在音频特征投影层，也同步关闭
+            if hasattr(self.model, 'audio_feature_projector'):
+                self.model.audio_feature_projector.eval()
+                for param in self.model.audio_feature_projector.parameters():
+                    param.requires_grad = False
 
         if "IndexTTS2" in self.train_config["tts_model"]:
             # IndexTTS2的s2mel部分始终冻结，不参与训练

@@ -284,7 +284,12 @@ class UniTAFDataset(Dataset):
             # 3. 处理目标音频,获取第二个chunk的目标音频作为GT,audio_codes
             # 加载音频文件并重采样到24kHz
             gt_waveform, st_sr = self.load_audio(second_chunk["audio_path"], target_sr=24000)
+            # print("[prepare_model_input] gt_waveform", gt_waveform.shape)  # torch.Size([1, 230400])  # 9.6s
             gt_feat, gt_attention_mask = self.semantic_extractor.extract(gt_waveform, st_sr)  # 使用SeamlessM4T特征提取器从音频中提取语义特征
+            # print("[prepare_model_input] gt_feat", gt_feat.shape)  # torch.Size([1, 479, 1024]
+            '''
+            token+1 就可得50个token表示一秒 故而9.6s音频用480-1个token表示，8s音频用400-1个token表示
+            '''
 
             # 在推理模式下进行特征提取
             with torch.inference_mode():
@@ -293,6 +298,7 @@ class UniTAFDataset(Dataset):
                 if gt_semantic_code.dim() > 1:  # 如果维度大于1，进行降维处理
                     gt_semantic_code = gt_semantic_code.squeeze(0)
                 gt_lengths = gt_attention_mask.sum(dim=1).long()
+                # print("[prepare_model_input] gt_semantic_code", gt_semantic_code.shape)  # torch.Size([479])
 
                 # 计算条件特征的有效长度（基于注意力掩码）
                 cond_lengths = cond_attention_mask.sum(dim=1).long()
@@ -357,12 +363,14 @@ class UniTAFDataset(Dataset):
             '''
             scale = self.sub_dataset_config["scale"]
 
-            face_data = self.load_npy_array(second_chunk["face_path"])
+            face_data = self.load_npy_array(second_chunk["face_path"])  # (240, 61)  30fps * 8s
+            # print(f"[prepare_model_input] raw face_data shape: {face_data.shape}")
             face_data = self.scale_and_offset(face_data, scale, 0.0)
-            face_data = face_data.reshape(len(face_data),-1).astype(np.float32)
+            face_data = face_data.reshape(len(face_data),-1).astype(np.float32)  # (240, 61)  30fps * 8s
+            # print(f"[prepare_model_input] after reshape: {face_data.shape}")
 
             face_type = second_chunk["face_type"]
-            face_fps = second_chunk["face_fps"]
+            face_fps = second_chunk["face_fps"]  # 30 fps
             speaker_idx = sample["speaker_idx"]
 
             id_template = self.id_template_list[speaker_idx]
@@ -391,10 +399,11 @@ class UniTAFDataset(Dataset):
                     face_fps = 25
 
             output["speaker_id"] = torch.as_tensor(speaker_idx, dtype=torch.long)
-            output["face_data"] = torch.as_tensor(face_data, dtype=torch.float)
+            output["face_data"] = torch.as_tensor(face_data, dtype=torch.float)  # L = fps * T
             output["face_template"] = torch.as_tensor(id_template, dtype=torch.float)
             output["face_type"] = face_type
             output["face_fps"] = torch.as_tensor(face_fps, dtype=torch.float)
+            # print(f"[resample] after : {face_data.shape[0]} frames @ {face_fps} fps")
 
         return output
 

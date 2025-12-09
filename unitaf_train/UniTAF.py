@@ -52,6 +52,10 @@ class UniTextAudioFaceModel(nn.Module):
                     checkpoint=Path("a2f/pretrained_models/UniTalker-L-D0-D7.pt"),
                     device=device,
                 )
+                # 如果同时存在UniTalker和IndexTTS2,则初始化中间特征的投影层
+                if "IndexTTS2" in cfg["tts_model"]:
+                    self.audio_feature_projector = self.build_audio_feature_projector(in_dim=1024, out_dim=1024)
+
 
     # 工具方法 --------------------------------------------------------------------------------------
     def build_indextts2_model(
@@ -164,6 +168,20 @@ class UniTextAudioFaceModel(nn.Module):
 
         return model.to(device)
 
+    def build_audio_feature_projector(self, in_dim=1024, out_dim=1024):
+        """
+        这里实例化用于将TTS的audio feature在时间长度和特征维度上与A2F Decoder对齐的投影层
+        """
+        from unitaf_train_component.audio_feature_projector import AudioFeatureProjector
+        proj = AudioFeatureProjector(in_dim, out_dim)
+        # TODO:如果有配置文件中权重，则加载该权重
+        # 随机初始化AudioFeatureProjector
+        with torch.no_grad():
+            # 卷积权重用 Kaiming 正态
+            nn.init.kaiming_normal_(proj.conv.weight, mode='fan_out', nonlinearity='relu')
+            # 偏置置零
+            nn.init.zeros_(proj.conv.bias)
+        return AudioFeatureProjector(in_dim, out_dim)
 
 
 if __name__ == '__main__':

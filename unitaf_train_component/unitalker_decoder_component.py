@@ -29,7 +29,7 @@ class UniTalkerDecoder(BaseModel):
 
         self.model_cfg = cfg["UniTalker"]
         self.dataset_cfg = cfg["dataset_config"]
-        self.loss_cfg = OmegaConf.load("a2f/config/unitalker.yaml").LOSS
+        self.loss_cfg = OmegaConf.load("a2f/config/unitalker.yaml")["LOSS"]
 
         # 选择具体Decoder
         if self.model_cfg.decoder_type == 'conv':
@@ -97,6 +97,10 @@ class UniTalkerDecoder(BaseModel):
         '''
         接收音频特征，生成最终面部表情
         '''
+        # print("[UniTalker Decoder] audio_feature shape:", audio_feature.shape)  # torch.Size([16, 240, 1024])
+        # print("[UniTalker Decoder] face_motion shape:", face_motion.shape)  # torch.Size([16, 240, 61])
+        face_motion = face_motion.unsqueeze(1)
+
         # 计算帧数
         if face_motion is not None:
             # 如果有真实面部运动数据，直接使用其帧数
@@ -107,6 +111,7 @@ class UniTalkerDecoder(BaseModel):
 
         # 解码器：将音频特征转换为面部运动参数
         decoder_out = self.decoder(audio_feature, style_idx, frame_num)  # torch.Size([B, L, 256])
+        # print("[UniTalker Decoder] decoder_out shape:", decoder_out.shape)  # torch.Size([16, 240, 256])
 
         # 输出处理
         if (not self.use_pca) or (annot_type not in self.pca_layer_dict):
@@ -130,16 +135,21 @@ class UniTalkerDecoder(BaseModel):
             else:
                 gt_pca = None
 
+        # print("[UniTalker Decoder] out_motion.shape", out_motion.shape)  # torch.Size([16, 240, 61])
+
         # 返回：最终运动参数、PCA系数（如果使用）、真实PCA系数（训练时）
         return out_motion, out_pca, gt_pca
 
     def compute_loss(self, out_motion, data, annot_type, out_pca, gt_pca):
         '''
         参考 UniTalker/main/train_eval_loop.train_epoch() 中 loss计算部分
+
+        out_motion 模型生成的面部动作
+        data 数据集中的GT 动作
         '''
         if self.loss_module is None:
             from a2f.loss.loss import UniTalkerLoss
-            self.loss_module = UniTalkerLoss(self.loss_cfg).cuda()
+            self.loss_module = UniTalkerLoss(self.loss_cfg).cuda()  # TODO:这里loss_cfg传入的是什么？
 
         rec_loss = self.loss_module(out_motion, data, annot_type)
         if out_pca is not None:

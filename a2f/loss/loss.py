@@ -214,20 +214,6 @@ class VerticesLoss(nn.Module):
 
 
 class BlendShapeLoss(nn.Module):
-    '''
-    系数空间（51 维 blendshape 权重）
-        普通模式:
-            直接 MSE(x, target)，对 51 维（或 61 维）系数做逐元素均方误差。
-        Style-control 模式:
-            把61维度拆成4组，非关键系数，眨眼[0,1]，下颔开合[19,20]，嘴型[40,41] 分别算 MSE 后按权重相加。
-    顶点空间（三维顶点坐标）
-        系数loss：
-            loss1 = bs_beta * MSE(x, target) 仍在系数空间加权，但权重由 bs_beta 控制。
-        顶点loss：
-            先把 51 维系数通过线性混合形状公式，还原成 N×3 的顶点，再算 MSE。
-    口部度量（mouth_metric）
-        只取 口部顶点索引（self.mouth_idx），计算 L2 距离并求 max-over-time 的误差，用于评估口部同步精度，不参与训练反向传播。
-    '''
     def __init__(self,
                  mouth_indices_path: str,
                  blendshape_path: str,
@@ -258,8 +244,8 @@ class BlendShapeLoss(nn.Module):
             self.mean_shape
 
     def get_vertices(
-        self,
-        x: torch.Tensor,
+            self,
+            x: torch.Tensor,
     ):
         x = self.bs2vertices(x)
         return x.reshape(-1, x.shape[-1] // 3, 3)
@@ -270,10 +256,87 @@ class BlendShapeLoss(nn.Module):
         ori_shape = x.shape
         target = target.reshape(*ori_shape[:-1], -1, 3)
         x = x.reshape(*ori_shape[:-1], -1, 3)
-        metric_L2 = (target[:, :, self.mouth_idx] - x[:, :, self.mouth_idx])**2
+        metric_L2 = (target[:, :, self.mouth_idx] - x[:, :, self.mouth_idx]) ** 2
         metric_L2 = metric_L2.sum(-1)
         metric_L2 = metric_L2.max(-1)[0]
-        metric_L2norm = metric_L2**0.5
+        metric_L2norm = metric_L2 ** 0.5
+        return metric_L2.mean(), metric_L2norm.mean()
+
+
+class BlendShapeLoss_61(nn.Module):
+    '''
+    专为 61 维 ARKit 混合形状系数设计的损失函数。
+    1. 系数空间：对 61 维权重做 MSE（可加权）。
+    2. 顶点空间：用线性混合形状公式还原成 3D 顶点后再算 MSE，提供主要梯度。
+    3. 口部度量：仅评估口部顶点同步精度，不参与反向传播。
+    '''
+
+    def __init__(self,
+                 mouth_indices_path: str,
+                 blendshape_path: str,
+                 bs_beta: float = 0.0,
+                 components_num: int = 51,
+                 ) -> None:
+        super().__init__()
+        # ---------- 加载静态资源 ----------
+        mouth_indices = np.load(mouth_indices_path)
+        self.register_buffer('mouth_idx', torch.from_numpy(mouth_indices))
+
+        blendshape = np.load(blendshape_path)
+        mean_shape = blendshape['meanshape'].reshape(-1).astype(np.float32)  # (V*3,)
+
+        blend_shape = blendshape['blendshape']
+        blend_shape = blend_shape.reshape(len(blend_shape), -1).astype(np.float32)  # (61, V*3)
+
+        self.register_buffer('mean_shape', torch.from_numpy(mean_shape))
+        self.register_buffer('blend_shape', torch.from_numpy(blend_shape))
+        # ---------------------------------
+        self.bs_beta = bs_beta           # 系数空间损失权重
+        self.mse = nn.MSELoss()
+
+        self.components_num = components_num
+
+    def forward(self, x: torch.Tensor, target: torch.Tensor):
+        """
+        x / target: (B, T, 61)  61 维 blendshape 权重
+        return: 标量总损失
+        """
+        # TODO:增加 style_control
+        loss_coeff = self.mse(x, target)  # 系数空间
+        loss_vert = self.mse(self.bs2vertices(x), self.bs2vertices(target))  # 顶点空间 取前面51维
+        return self.bs_beta * loss_coeff + loss_vert
+
+    # ---------- 系数 -> 顶点 ----------
+    def bs2vertices(self, x: torch.Tensor):
+        # print("self.components_num: ", self.components_num)
+        # print("self.blend_shape: ", self.blend_shape.shape, "self.mean_shape: ", self.mean_shape.shape)
+        # 这里components_num为51，只取前51维，因为self.blend_shape权重只有前51维
+
+        # 取最后一维的前 components_num 维
+        coeff = x[..., :self.components_num]  # (B, T, 51)
+        vertices = coeff @ self.blend_shape[:self.components_num] + self.mean_shape
+        return vertices
+
+    def get_vertices(self, x: torch.Tensor):
+        x = x[..., :51]  # 取前面51维的部分
+        x = self.bs2vertices(x)
+        return x.reshape(-1, x.shape[-1] // 3, 3)
+
+    def mouth_metric(self, x: torch.Tensor, target: torch.Tensor):
+        # modify x and target shape
+        if x.shape[-1] == 61:
+            x = x[..., :51]
+            target = target[..., :51]
+
+        target = self.bs2vertices(target)
+        x = self.bs2vertices(x)
+        ori_shape = x.shape
+        target = target.reshape(*ori_shape[:-1], -1, 3)
+        x = x.reshape(*ori_shape[:-1], -1, 3)
+        metric_L2 = (target[:, :, self.mouth_idx] - x[:, :, self.mouth_idx]) ** 2
+        metric_L2 = metric_L2.sum(-1)
+        metric_L2 = metric_L2.max(-1)[0]
+        metric_L2norm = metric_L2 ** 0.5
         return metric_L2.mean(), metric_L2norm.mean()
 
 
@@ -306,6 +369,16 @@ class UniTalkerLoss(nn.Module):
     def __init__(self, args) -> None:
         super().__init__()
         loss_config = {
+            'qxsk_inhouse_blendshape_weight': {
+                'class': BlendShapeLoss_61,
+                'args': {
+                    'mouth_indices_path':
+                    'a2f/resources/binary_resources/05_inhouse_arkit_mouth_idx.npy',
+                    'blendshape_path':
+                    'a2f/resources/binary_resources/inhouse_arkit.npz',
+                    'bs_beta': args.blendshape_weight,
+                },
+            },
             'flame_params_from_dadhead': {
                 'class': FlameParamLossForDADHead,
                 'args': {
@@ -386,6 +459,8 @@ class UniTalkerLoss(nn.Module):
         target: torch.Tensor,
         annot_type: str,
     ):
+        # print(f"[UniTalkerLoss] x: {x.shape}, target: {target.shape}, annot_type: {annot_type}")
+        # x: torch.Size([16, 240, 61]), target: torch.Size([16, 240, 61]), annot_type: qxsk_inhouse_blendshape_weigh
         return self.loss_module_dict[annot_type](x, target)
 
     def pca_loss(self, x: torch.Tensor, target: torch.Tensor):
