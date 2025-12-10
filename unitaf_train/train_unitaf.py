@@ -30,7 +30,7 @@ project_root = os.path.dirname(current_dir)  # unitaf_train的父目录
 sys.path.insert(0, project_root)
 
 # ----进行包修复----
-# chumpy 最后一次更新停留在 2018 年，内部用了 Python 3 已废弃的 inspect.getargspec，在 Python≥3.11 会报：
+# UniTalker loss计算所需的包 chumpy 最后一次更新停留在 2018 年，内部用了 Python 3 已废弃的 inspect.getargspec，在 Python≥3.11 会报：
 # AttributeError: module 'inspect' has no attribute 'getargspec'
 import inspect
 inspect.getargspec = inspect.getfullargspec  # 这里临时补丁修复，否则会影响UniTalker Loss计算
@@ -289,18 +289,32 @@ class UniTAFTrainer(Trainer):
                 # vc_target = vc_target[:, :, ref_mel.size(-1):]  # 裁剪目标梅尔谱图
 
         # 2. 获得TTS部分核心输出 处理audio feature
-        if "IndexTTS2" in self.train_config["tts_model"]:
+        if "IndexTTS2" in self.train_config["tts_model"] and "UniTalker" in self.train_config["a2f_model"]:
             '''
-            在IndexTTS2 24000 (24K)音频采样率下, 实际产生的token数为 T(秒) * 50 -1, 可以几乎认为是50个token表示一秒.
+            1. 获取我们需要的audio_feature
+            一般情况下，在IndexTTS2 24000 (24K)音频采样率下, 实际产生的token数为 T(秒) * 50 -1, 可以几乎认为是50个token表示一秒.
             而UniTalker Decoder我们设置帧率为25fps.
             
-            因此我们在porjector层只需要将获取的音频长度padding一个token后, 降采样到1/2即可与GT Face Data的25fps 同步
+            2. 我们需要确保audio_feature与2倍的face_data长度一致
+            
+            3. 因此我们在porjector层只需要将获取的音频长度padding一个token后, 降采样到1/2即可与GT Face Data的25fps 同步
             '''
             # (1) 暂定使用 经过s2mel.models["gpt_layer"]处理后的 mel_latent
             audio_feature = mel_latent  # torch.Size([B, L, 1024])
 
-            # (2) 为audio_feature的长度 L 增加 1. (B, L, 1024) -> (B, L+1, 1024), 以便正好被整每秒50个token数整除
-            # 使用额外的projector层，将长度降采样到1/2， (B, L+1, 1024) -> (B, (L+1)/2, 1024)
+            # (2) 为audio_feature的长度 L 增加 n 与2倍的face_data长度一致. (B, L, 1024) -> (B, L+n, 1024), 以便正好被整每秒50个token数整除
+            face_frames = batch["face_data"].size(1)
+            audio_len = audio_feature.size(1)
+            need_tokens = face_frames * 2
+
+            if audio_len < need_tokens:
+                pad_len = need_tokens - audio_len
+                audio_feature = F.pad(audio_feature, (0, 0, 0, pad_len), mode='constant', value=0)  # (B, L+n, 1024)
+            elif audio_len > need_tokens:
+                # 如果 token 比需求多，直接截断（也可插值，但截断最快）
+                audio_feature = audio_feature[:, :need_tokens, :]
+
+            # (3) 使用额外的projector层，将长度降采样到1/2， (B, L, 1024) -> (B, L/2, 1024)
             audio_feature = self.model.audio_feature_projector(audio_feature)
             # print("[compute loss] audio_feature.shape", audio_feature.shape)  # torch.Size([16, 240, 1024])
 
@@ -607,6 +621,38 @@ class UniTAFTrainer(Trainer):
         # TODO
         return {}
 
+    def _save_checkpoint(self, model, trial, metrics=None):
+        '''
+        重写Trainer._save_checkpoint()保存逻辑
+        只保存UniTAF.state_dict()实现的指定的部分模块权重
+        '''
+        output_dir = self.args.output_dir
+        os.makedirs(output_dir, exist_ok=True)
+
+        # 1. TTS 权重
+        if hasattr(model, 'tts_model') and any(p.requires_grad for p in model.tts_model.parameters()):
+            tts_path = os.path.join(output_dir, "tts_model.bin")
+            torch.save(model.tts_model.state_dict(), tts_path)
+
+        # 2. A2F 权重（不含 loss_module）
+        if hasattr(model, 'a2f_model') and any(p.requires_grad for p in model.a2f_model.parameters()):
+            a2f_sd = {k: v for k, v in model.a2f_model.state_dict().items() if 'loss_module' not in k}
+            torch.save(a2f_sd, os.path.join(output_dir, "a2f_model.bin"))
+
+        # 3. 投影层
+        if hasattr(model, 'audio_feature_projector') and any(p.requires_grad for p in model.audio_feature_projector.parameters()):
+            torch.save(model.audio_feature_projector.state_dict(),
+                       os.path.join(output_dir, "audio_feature_projector.bin"))
+
+        # 4. 让父类继续保存 optimizer / scheduler / args 等
+        # 根据签名决定怎么调父类
+        sig = inspect.signature(super()._save_checkpoint)
+        if 'metrics' in sig.parameters:
+            super()._save_checkpoint(model, trial, metrics=metrics)
+        else:
+            super()._save_checkpoint(model, trial)
+
+
     def log_validation(self, metrics, step):
         """占位：把验证指标打印出来，后续可接 wandb"""
         # TODO
@@ -684,6 +730,8 @@ if __name__ == '__main__':
     '''
     python unitaf_train/train_unitaf.py 
     '''
+    # 设置使得Trainer限制在固定卡上
+    os.environ["CUDA_VISIBLE_DEVICES"] = "1"  # 只用第 1 号卡，此时会从可见卡开始编码cuda:0,cuda:1...
 
     train_config = {
         # 模型类型，这里用于指导训练器类训练哪些模型
@@ -724,17 +772,17 @@ if __name__ == '__main__':
         # dataloader设置
         "num_workers": 2,
         # 设备
-        "device": "cuda:1",
+        "device": "cuda:0",  # 注: 需要与外部的CUDA_VISIBLE_DEVICES一致!但只有一个可见卡时，硬编码则应该是cuda：0
         # 训练设置-------------------------------------------------------------------------------------------------------
         "batch_size": 2,
         "epochs": 2,
         "grad_accumulation": 1,
         "grad_clip": 1.0,
         "use_amp": True,
-        "warmup_steps": 50, # 所有调度器统一参数 warmup 为50
-        "log_interval": 1,  # training_step 里打印 loss 的步长
-        "val_interval": 500,  # 每隔多少 step 做一次验证
-        "save_interval": 1000,  # 每隔多少 step 存一次 ckpt
+        "warmup_steps": 10, # 所有调度器统一参数 warmup 为50
+        "log_interval": 5,  # training_step 里打印 loss 的步长
+        "val_interval": 30,  # 每隔多少 step 做一次验证
+        "save_interval": 50,  # 每隔多少 step 存一次 ckpt  TODO：保存时遇到张量不连续问题
         "output_dir": "./unitaf_ckpt",  # 断点 & 日志保存根目录
         "resume_path": None,  # 如需断点续训，填 ckpt 路径或 True
         # 分别训练tts和a2f的配置

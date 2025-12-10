@@ -880,21 +880,19 @@ if __name__ == "__main__":
     # experiment.experiment5_emo_alpha_sensitivity()
 
     # 实验：比较TTS audio与GT audio差异
-    experiment.compare_tts_audio_and_GT_audio()
+    # experiment.compare_tts_audio_and_GT_audio()
 
 
     # 不使用批量实验，单独测试
-    # text = "酒楼丧尽天良，开始借机竞拍房间，哎，一群蠢货。"
-    # experiment.tts.infer(
-    #     spk_audio_prompt='examples/voice_07.wav',
-    #     text=text,
-    #     output_path="gen.wav",
-    #     emo_audio_prompt="examples/emo_sad.wav",
-    #     # 当指定情感参考音频文件时，你可以选择设置 emo_alpha 来调整对输出的影响程度。
-    #     emo_alpha=0.9,  # 有效范围为 0.0 - 1.0，默认值为 1.0
-    #     verbose=True
-    # )
-
+    text = "哇塞！这个爆率也太高了！欧皇附体了！"
+    experiment.tts.infer(
+        spk_audio_prompt='examples/voice_10.wav',
+        text=text,
+        output_path="gen.wav",
+        emo_vector=[0, 0, 0, 0, 0, 0, 0.45, 0],
+        use_random=False,  # 还可以使用 use_random 参数在推理过程中引入随机性; 随机采样会降低语音合成的声音克隆精度.
+        verbose=True
+    )
     # text = "快躲起来！是他要来了！他要来抓我们了！"
     # experiment.tts.infer(
     #     spk_audio_prompt='examples/voice_12.wav',

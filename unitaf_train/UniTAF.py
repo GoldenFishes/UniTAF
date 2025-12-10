@@ -5,7 +5,7 @@ from omegaconf import OmegaConf
 import sys
 import os
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple, Any
 
 import torch
 import torch.nn as nn
@@ -56,6 +56,24 @@ class UniTextAudioFaceModel(nn.Module):
                 if "IndexTTS2" in cfg["tts_model"]:
                     self.audio_feature_projector = self.build_audio_feature_projector(in_dim=1024, out_dim=1024)
 
+    def state_dict(self, *args, destination=None, prefix="", keep_vars=False):
+        """
+        保存：只返回需要训练的参数
+        """
+        sd = {}
+        if hasattr(self, 'tts_model') and self.training:
+            sd.update({f'tts_model.{k}': v for k, v in self.tts_model.state_dict().items()})
+        if hasattr(self, 'audio_feature_projector') and self.training:
+            sd.update({f'audio_feature_projector.{k}': v for k, v in self.audio_feature_projector.state_dict().items()})
+        if hasattr(self, 'a2f_model') and self.training:
+            # 跳过 loss_module（不保存）
+            for name, param in self.a2f_model.named_parameters():
+                if 'loss_module' not in name:
+                    sd[f'a2f_model.{name}'] = param
+            for name, buffer in self.a2f_model.named_buffers():
+                if 'loss_module' not in name:
+                    sd[f'a2f_model.{name}'] = buffer
+        return sd
 
     # 工具方法 --------------------------------------------------------------------------------------
     def build_indextts2_model(

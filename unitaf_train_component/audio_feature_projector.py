@@ -11,8 +11,7 @@ import torch.nn.functional as F
 
 class AudioFeatureProjector(nn.Module):
     """
-    (2) 先在时间维 pad 1 帧，保证 (L+1) 能被 50 token/s 整除；
-    (3) 用 1-D 卷积把长度降采样到 1/2，同时保持特征维 1024 不变。
+    用 1-D 卷积把长度降采样到 1/2，同时保持特征维 1024 不变。
     """
     def __init__(self, in_dim: int = 1024, out_dim: int = 1024):
         super().__init__()
@@ -22,10 +21,8 @@ class AudioFeatureProjector(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         x: (B, L, 1024)
-        return: (B, (L+1)//2, 1024)
+        return: (B, L/2, 1024)
         """
-        # (2) 右侧 pad 1 帧
-        x = F.pad(x, (0, 0, 0, 1), mode='constant', value=0)   # (B, L+1, 1024)
-        # (3) 降采样
+        # 降采样
         x = self.conv(x.transpose(1, 2)).transpose(1, 2)       # (B, (L+1)//2, 1024)
         return x
