@@ -120,6 +120,11 @@ class UniTalkerDecoder(BaseModel):
             out_motion = out_motion + template  # 加上模板得到绝对坐标
             out_pca, gt_pca = None, None
 
+            # print("[DEBUG] 不使用PCA out_motion max=", out_motion.abs().max().item(),  # 检查这里是否有梯度
+            #       "mean=", out_motion.mean().item(),
+            #       "requires_grad=", out_motion.requires_grad,
+            #       "grad_fn=", out_motion.grad_fn)
+
         else:
             # 使用PCA的情况：先得到PCA系数，再解码为运动参数
             out_pca = self.out_head_dict[annot_type](decoder_out)
@@ -127,6 +132,11 @@ class UniTalkerDecoder(BaseModel):
             out_motion = self.pca_layer_dict[annot_type].decode(
                 out_pca, self.pca_dim)
             out_motion = out_motion + template  # 加上模板得到绝对坐标
+
+            # print("[DEBUG] 使用PCA out_motion max=", out_motion.abs().max().item(),  # 检查这里是否有梯度
+            #       "mean=", out_motion.mean().item(),
+            #       "requires_grad=", out_motion.requires_grad,
+            #       "grad_fn=", out_motion.grad_fn)
 
             # 训练时计算真实数据的PCA系数（用于损失计算）
             if face_motion is not None:
@@ -149,7 +159,7 @@ class UniTalkerDecoder(BaseModel):
         '''
         if self.loss_module is None:
             from a2f.loss.loss import UniTalkerLoss
-            self.loss_module = UniTalkerLoss(self.loss_cfg).cuda()  # TODO:这里loss_cfg传入的是什么？
+            self.loss_module = UniTalkerLoss(self.loss_cfg).cuda()
 
         rec_loss = self.loss_module(out_motion, data, annot_type)
         if out_pca is not None:

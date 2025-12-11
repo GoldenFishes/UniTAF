@@ -40,6 +40,12 @@ class UniTalkerDecoderTCN(BaseModel):
         else:
             style_embedding = self.learnable_style_emb(style_idx)  # [B, 64]
 
+        # print("[DEBUG] style_idx=", style_idx.cpu().numpy(),
+        #       "style_emb max=", style_embedding.abs().max().item(),
+        #       "mean=", style_embedding.mean().item())
+        # [DEBUG] style_idx= [11  2] style_emb max= 2.3971335887908936 mean= -0.05191050097346306
+
+
         # 5. 音频先过线性映射 → [B, T, in_dim]
         feature = self.audio_feature_map(hidden_states).transpose(1, 2)  # [B, in_dim, T]
 

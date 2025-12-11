@@ -1,5 +1,12 @@
 '''
 这里实现 文本-音频-表情 联合模型的组装
+
+一般情况下联合模型必定会由TTS模块（tts_model）,A2F模块（a2f_model）和
+连接两者的特征投影层（audio_feature_projector）组成.
+
+需要注意的是，在训练过程中，这里tts_model一般仅为TTS中自回归transformer部分！
+其余的TTS音频编码器/解码器都放在Dataset类中以推理模式进行数据预处理。
+
 '''
 from omegaconf import OmegaConf
 import sys
@@ -19,7 +26,7 @@ class UniTextAudioFaceModel(nn.Module):
     ):
         super().__init__()
         '''
-        根据 tts_model_name 与 a2f_model_name 中模型名称来判断初始化那些模型
+        根据 tts_model_name 与 a2f_model_name 中模型名称来判断初始化哪些模型
         '''
         self.cfg = cfg
         self.mode = mode
@@ -62,7 +69,7 @@ class UniTextAudioFaceModel(nn.Module):
         """
         sd = {}
         if hasattr(self, 'tts_model') and self.training:
-            sd.update({f'tts_model.{k}': v for k, v in self.tts_model.state_dict().items()})
+            sd.update(self.tts_model.state_dict(prefix='tts_model.'))
         if hasattr(self, 'audio_feature_projector') and self.training:
             sd.update({f'audio_feature_projector.{k}': v for k, v in self.audio_feature_projector.state_dict().items()})
         if hasattr(self, 'a2f_model') and self.training:
@@ -181,7 +188,8 @@ class UniTextAudioFaceModel(nn.Module):
             cfg["UniTalker"]["audio_encoder_feature_dim"] = 1024  # 设置默认为1024 来自IndexTTS.s2mel.models['gpt_layer']的维度
             # 实际中这里最好在外部提前判断
 
-        model = UniTalkerDecoder(cfg)  # 实例化UniTalker Decoder
+        # 实例化UniTalkerDecoder
+        model = UniTalkerDecoder(cfg)
         model.load_state_dict(checkpoint, strict=False)
 
         return model.to(device)
@@ -201,6 +209,15 @@ class UniTextAudioFaceModel(nn.Module):
             nn.init.zeros_(proj.conv.bias)
         return AudioFeatureProjector(in_dim, out_dim)
 
+
+# ---------- 一次性检查工具方法 ----------
+def dump_param_count(model: nn.Module, name: str):
+    total = sum(p.numel() for p in model.parameters())
+    print(f"{name:25s}  init params : {total:,}")
+
+def dump_state_dict_count(sd: dict, name: str):
+    total = sum(v.numel() for v in sd.values())
+    print(f"{name:25s}  state_dict  : {total:,}")
 
 if __name__ == '__main__':
     """
@@ -252,27 +269,54 @@ if __name__ == '__main__':
 
     unitaf = UniTextAudioFaceModel(cfg, device=torch.device("cuda:0"), mode="train")
 
-    # 打印模型结构
+    # 1. 打印模型结构
     print("=" * 80)
     print("Model architecture:")
     print("=" * 80)
     print(unitaf)
 
-    # 打印模型的所有层及其参数
-    print("\n" + "=" * 80)
-    print("Model layers and parameters:")
-    print("=" * 80)
-    for name, module in unitaf.named_children():
-        print(f"\n{name}: {type(module).__name__}")
+    # # 2. 打印模型的所有层及其参数
+    # print("\n" + "=" * 80)
+    # print("Model layers and parameters:")
+    # print("=" * 80)
+    # for name, module in unitaf.named_children():
+    #     print(f"\n{name}: {type(module).__name__}")
+    #
+    #     # 如果是ModuleDict或ModuleList，打印其内容
+    #     if isinstance(module, (nn.ModuleDict, nn.ModuleList)):
+    #         for sub_name, sub_module in module.named_children():
+    #             print(f"  {sub_name}: {type(sub_module).__name__}")
+    #             if hasattr(sub_module, 'parameters') and list(sub_module.parameters()):
+    #                 print(f"    Parameters: {sum(p.numel() for p in sub_module.parameters())}")
 
-        # 如果是ModuleDict或ModuleList，打印其内容
-        if isinstance(module, (nn.ModuleDict, nn.ModuleList)):
-            for sub_name, sub_module in module.named_children():
-                print(f"  {sub_name}: {type(sub_module).__name__}")
-                if hasattr(sub_module, 'parameters') and list(sub_module.parameters()):
-                    print(f"    Parameters: {sum(p.numel() for p in sub_module.parameters())}")
+    # 3. 打印模型初始化参数量与保存的参数量
+    print("=" * 60)
+    print(">>> 初始化后参数量")
+    dump_param_count(unitaf.tts_model, "tts_model")
+    dump_param_count(unitaf.a2f_model, "a2f_model")
+    dump_param_count(unitaf.audio_feature_projector, "audio_feature_projector")
+    print("-" * 60)
+    print(">>> 自定义 state_dict 过滤后")
+    sd = unitaf.state_dict()
+    dump_state_dict_count({k: v for k, v in sd.items() if k.startswith('tts_model.')}, "tts_model")
+    dump_state_dict_count({k: v for k, v in sd.items() if k.startswith('a2f_model.')}, "a2f_model")
+    dump_state_dict_count({k: v for k, v in sd.items() if k.startswith('audio_feature_projector.')}, "audio_feature_projector")
+    print("=" * 60)
 
-    # # 打印模型参数详情
+    # FIXME: 这里打印出来tts_model的为什么过滤后比初始化时多？
+    '''
+    >>> 初始化后参数量
+    tts_model                  init params : 865,980,639
+    a2f_model                  init params : 1,225,213
+    audio_feature_projector    init params : 2,098,176
+    ------------------------------------------------------------
+    >>> 自定义 state_dict 过滤后
+    tts_model                  state_dict  : 871,100,639
+    a2f_model                  state_dict  : 1,225,213
+    audio_feature_projector    state_dict  : 2,098,176
+    '''
+
+    # # 4. 打印模型参数详情
     # print("\n" + "=" * 80)
     # print("Detailed parameters:")
     # print("=" * 80)
