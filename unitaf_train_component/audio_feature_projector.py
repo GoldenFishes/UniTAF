@@ -17,8 +17,10 @@ class AudioFeatureProjector(nn.Module):
         super().__init__()
         #  kernel=2, stride=2  -> 长度减半
         self.conv = nn.Conv1d(in_dim, out_dim, kernel_size=2, stride=2)
+
         # 初始化成 1000 倍（让模型自己慢慢降到正常幅度）
-        self.audio_scale = nn.Parameter(torch.tensor(1000.0))  # 可学习幅度
+        self.audio_scale = nn.Parameter(torch.tensor(1.0))  # 可学习幅度
+        self.norm = nn.LayerNorm(out_dim)  # 在特征维度上归一化
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -27,4 +29,6 @@ class AudioFeatureProjector(nn.Module):
         """
         # 降采样
         x = self.conv(x.transpose(1, 2)).transpose(1, 2)       # (B, (L+1)//2, 1024)
-        return x * self.audio_scale
+        x = self.norm(x) * self.audio_scale
+
+        return x

@@ -95,10 +95,18 @@ class TCN(nn.Module):
         style_embed = style_embed.unsqueeze(2)
         style_embed = style_embed.repeat(1, 1, spectrogram.shape[2])
         spectrogram = torch.cat([spectrogram, style_embed], dim=1)
+        # # ---- 钩子：TCN 入口 ----
+        # spectrogram.register_hook(lambda g: print(f'TCN-in   grad_norm: {g.norm().item():.8f}'))
+
         x1 = self.first_net(spectrogram)  # .permute(0, 2, 1)
+        # # ---- 钩子：TCN 主干出口 ----
+        # x1.register_hook(lambda g: print(f'first_net grad_norm: {g.norm().item():.8f}'))
+
         if time_steps is not None:
             x1 = F.interpolate(
                 x1, size=time_steps, align_corners=False, mode='linear')
+            # # 如需钩子可再挂
+            # x1.register_hook(lambda g: print(f'interpolate grad_norm: {g.norm().item():.8f}'))
 
         return x1
 

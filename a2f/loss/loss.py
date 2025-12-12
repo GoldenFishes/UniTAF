@@ -304,7 +304,14 @@ class BlendShapeLoss_61(nn.Module):
         # TODO:增加 style_control
         loss_coeff = self.mse(x, target)  # 系数空间
         loss_vert = self.mse(self.bs2vertices(x), self.bs2vertices(target))  # 顶点空间 取前面51维
-        return self.bs_beta * loss_coeff + loss_vert
+
+        # print('loss_coeff=', loss_coeff.item(),
+        #       'loss_vert=', loss_vert.item(),
+        #       'total=', (self.bs_beta * loss_coeff + loss_vert).item())
+        # loss_coeff= 0.008641262538731098 loss_vert= 3.773815478780307e-06 total= 4.637941856344696e-06
+
+        # return self.bs_beta * loss_coeff + loss_vert  # FIXME：这里不采用顶点坐标的loss贡献
+        return loss_coeff  # 直接返回系数空间的mse loss
 
     # ---------- 系数 -> 顶点 ----------
     def bs2vertices(self, x: torch.Tensor):

@@ -10,6 +10,13 @@ from .model_utils import (
 
 # yapf: enable
 
+# ---------- 梯度钩子：逐层打印范数 ----------
+def hook_fn(name):
+    def fn(grad):
+        gnorm = grad.norm().item() if grad is not None else 0.0
+        print(f'{name:40s} grad_norm = {gnorm:.8f}')
+        return grad      # 必须返回，否则梯度传不下去
+    return fn
 
 class UniTalkerDecoderTCN(BaseModel):
 
@@ -40,24 +47,32 @@ class UniTalkerDecoderTCN(BaseModel):
         else:
             style_embedding = self.learnable_style_emb(style_idx)  # [B, 64]
 
-        # print("[DEBUG] style_idx=", style_idx.cpu().numpy(),
-        #       "style_emb max=", style_embedding.abs().max().item(),
-        #       "mean=", style_embedding.mean().item())
-        # [DEBUG] style_idx= [11  2] style_emb max= 2.3971335887908936 mean= -0.05191050097346306
-
-
         # 5. 音频先过线性映射 → [B, T, in_dim]
         feature = self.audio_feature_map(hidden_states).transpose(1, 2)  # [B, in_dim, T]
+        # # ---- 手动检查局部梯度 ----
+        # dummy_loss = feature.sum()  # 造一个简单 loss
+        # grad_test = torch.autograd.grad(
+        #     outputs=dummy_loss,
+        #     inputs=hidden_states,
+        #     retain_graph=True,
+        #     create_graph=False,
+        #     allow_unused=True
+        # )[0]
+        # print('局部梯度 d(feature)/d(hidden_states)  norm =', grad_test.norm().item())  # 270.
+        # feature.register_hook(lambda g: print(f'audio_feature_map grad_norm: {g.norm().item():.8f}'))
 
         # 6. 把风格向量拼到每一帧，一起送给 TCN
         #    TCN 内部是因果/空洞卷积，纯并行，一次前向就出完整序列
         feature = self.tcn(feature, style_embedding)  # 返回 [B, out_dim, T]
+        # feature.register_hook(lambda g: print(f'tcn_out grad_norm: {g.norm().item():.8f}'))
+
 
         feature = feature.transpose(1, 2)  # [B, T, out_dim]
 
         # 7. 如果下游需要固定帧数，再做线性插值
         if self.interpolate_pos == 2:
             feature = linear_interpolation(feature, output_len=frame_num)
+        #    feature.register_hook(lambda g: print(f'linear_interp grad_norm: {g.norm().item():.8f}'))  # 如果不需要可省
 
         return feature  # 一次拿到全部帧
 

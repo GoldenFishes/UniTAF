@@ -53,6 +53,8 @@ from omegaconf import OmegaConf
 import argparse
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Set, Tuple
+from collections import defaultdict
+from tqdm import tqdm
 
 import torch
 import torch.nn.functional as F
@@ -71,6 +73,21 @@ from unitaf_dataset import UniTAFDataset
 # 组装联合模型UniTextAudioFace的类
 from UniTAF import UniTextAudioFaceModel
 
+class AverageMeter:
+    """最简单的均值累计器"""
+    def __init__(self):
+        self.reset()
+    def reset(self):
+        self.val = 0.
+        self.sum = 0.
+        self.count = 0
+    def update(self, val, n=1):
+        self.val = val
+        self.sum += val * n
+        self.count += n
+    @property
+    def avg(self):
+        return self.sum / self.count if self.count else 0.
 
 class MultiOptimizer:
     """包装多个优化器，使其像单个优化器一样工作"""
@@ -140,6 +157,7 @@ class UniTAFTrainer(Trainer):
                 output_dir=train_config.get("output_dir", "./unitaf_ckpt"),
                 num_train_epochs=train_config["epochs"],
                 per_device_train_batch_size=train_config["batch_size"],
+                per_device_eval_batch_size=train_config["batch_size"], # 验证batch size暂定与训练一致
                 gradient_accumulation_steps=train_config["grad_accumulation"],
                 warmup_steps=train_config.get("warmup_steps", 50),
                 learning_rate=train_config["tts_train_cfg"]["lr"],  # 这里我们实际上后续会使用.create_optimizer()来重新构建优化器
@@ -296,28 +314,24 @@ class UniTAFTrainer(Trainer):
         # 2. 获得TTS部分核心输出 处理audio feature
         if "IndexTTS2" in self.train_config["tts_model"] and "UniTalker" in self.train_config["a2f_model"]:
             '''
-            1. 获取我们需要的audio_feature
-            一般情况下，在IndexTTS2 24000 (24K)音频采样率下, 实际产生的token数为 T(秒) * 50 -1, 可以几乎认为是50个token表示一秒.
-            而UniTalker Decoder我们设置帧率为25fps.
-            
+            1. 获取我们需要的audio_feature： torch.Size([B, L, 1024])
+                一般情况下，在IndexTTS2 24000 (24K)音频采样率下, 实际产生的token数为 T(秒) * 50 -1, 可以几乎认为是50个token表示一秒.
+                而UniTalker Decoder我们设置帧率为25fps.
             2. 我们需要确保audio_feature与2倍的face_data长度一致
-            
             3. 因此我们在porjector层只需要将获取的音频长度padding一个token后, 降采样到1/2即可与GT Face Data的25fps 同步
             '''
             # (1) 暂定使用 经过s2mel.models["gpt_layer"]处理后的 mel_latent
-            audio_feature = mel_latent  # torch.Size([B, L, 1024])
+            audio_feature = mel_latent
 
             # (2) 为audio_feature的长度 L 增加 n 与2倍的face_data长度一致. (B, L, 1024) -> (B, L+n, 1024), 以便正好被整每秒50个token数整除
             face_frames = batch["face_data"].size(1)
-            audio_len = audio_feature.size(1)
             need_tokens = face_frames * 2
 
-            if audio_len < need_tokens:
-                pad_len = need_tokens - audio_len
+            if audio_feature.size(1) < need_tokens:
+                pad_len = need_tokens - audio_feature.size(1)
                 audio_feature = F.pad(audio_feature, (0, 0, 0, pad_len), mode='constant', value=0)  # (B, L+n, 1024)
-            elif audio_len > need_tokens:
-                # 如果 token 比需求多，直接截断（也可插值，但截断最快）
-                audio_feature = audio_feature[:, :need_tokens, :]
+            elif audio_feature.size(1) > need_tokens:
+                audio_feature = audio_feature[:, :need_tokens, :]  # 如果 token 比需求多，直接截断（也可插值，但截断最快）
 
             # (3) 使用额外的projector层，将长度降采样到1/2， (B, L, 1024) -> (B, L/2, 1024)
             audio_feature = self.model.audio_feature_projector(audio_feature)
@@ -325,6 +339,11 @@ class UniTAFTrainer(Trainer):
 
             # print("audio_feature.requires_grad:", audio_feature.requires_grad)  # True
             # print('audio_feature.grad_fn:', audio_feature.grad_fn)  # 且存在grad_fn
+
+            # print('audio_feature  mean/absmean/max :',
+            #       audio_feature.mean().item(),
+            #       audio_feature.abs().mean().item(),
+            #       audio_feature.max().item())  # 检查audio_feature是否纯在数值太小的量级问题
 
 
         # 3. A2F Decoder接收audio feature
@@ -337,6 +356,7 @@ class UniTAFTrainer(Trainer):
                 face_type 表情数据的格式
                 face_fps 表情帧率
             """
+
             face_data = batch["face_data"].to(device, non_blocking=True)
             face_type = batch["face_type"][0]
             identity = batch["speaker_idx"].to(device, non_blocking=True)
@@ -347,56 +367,28 @@ class UniTAFTrainer(Trainer):
                 style_idx=identity ,annot_type=face_type,
             )
 
-            # ===== 关键检查点1：检查A2F输出的梯度状态 =====
-            print("\n[DEBUG] 检查A2F输出梯度状态:")
-            print(f"out_motion.requires_grad: {out_motion.requires_grad}")
-            print(f"out_motion.shape: {out_motion.shape}")
-            if out_motion.grad_fn is not None:
-                print(f"out_motion.grad_fn: {out_motion.grad_fn}")
-                # 追溯梯度链
-                node = out_motion.grad_fn
-                depth = 0
-                while node is not None and depth < 3:
-                    print(f"  L{depth}: {str(node)[:80]}")
-                    node = node.next_functions[0][0] if node.next_functions else None
-                    depth += 1
-            else:
-                print("❌ out_motion.grad_fn 是 None!")
+            # # ===== 关键检查点1：检查A2F输出的梯度状态 =====
+            # print("\n[DEBUG] 检查A2F输出梯度状态:")  # 梯度状态正常
+            # print(f"out_motion.requires_grad: {out_motion.requires_grad}")
+            # print(f"out_motion.shape: {out_motion.shape}")
+            # if out_motion.grad_fn is not None:
+            #     print(f"out_motion.grad_fn: {out_motion.grad_fn}")
+            #     # 追溯梯度链
+            #     node = out_motion.grad_fn
+            #     depth = 0
+            #     while node is not None and depth < 3:
+            #         print(f"  L{depth}: {str(node)[:80]}")
+            #         node = node.next_functions[0][0] if node.next_functions else None
+            #         depth += 1
+            # else:
+            #     print("❌ out_motion.grad_fn 是 None!")
 
             # TODO:计算loss的时候带上batch["face_data_len"]来生成有效部分的mask
             # 由我们单独实现的unitalker_decoder_component.UniTalkerDecoder.compute_loss()中计算loss
             rec_loss, pca_loss = self.model.a2f_model.compute_loss(out_motion, face_data, face_type, out_pca, gt_pca)
 
-            # ===== 关键检查点2：检查损失的梯度状态 =====
-            print("\n[DEBUG] 检查A2F损失梯度状态:")
-            print(f"rec_loss: {rec_loss.item()}")
-            print(f"rec_loss.requires_grad: {rec_loss.requires_grad}")
-            print(f"rec_loss.grad_fn: {rec_loss.grad_fn}")
-
-            if rec_loss.grad_fn is not None:
-                print("✅ rec_loss 有梯度链")
-            else:
-                print("❌ rec_loss 没有梯度链!")
-                # 紧急检查：尝试手动计算梯度
-                try:
-                    test_grad = torch.autograd.grad(
-                        outputs=rec_loss,
-                        inputs=audio_feature,
-                        retain_graph=True,
-                        allow_unused=True
-                    )[0]
-                    if test_grad is not None:
-                        print(f"⚠️ 手动计算的audio_feature梯度: {test_grad.norm().item()}")
-                    else:
-                        print("❌ rec_loss 对 audio_feature 的梯度是 None")
-                except Exception as e:
-                    print(f"梯度计算错误: {e}")
-
             loss["a2f_rec_loss"] = rec_loss
             loss["a2f_pca_loss"] = pca_loss
-
-        # FIXME:在此处试验发现rec_loss根本没有对audio_feature产生任何梯度，
-        #  说明计算图在audio_feature -> a2f_model -> rec_loss 这条路上断了
 
         return loss
 
@@ -473,27 +465,28 @@ class UniTAFTrainer(Trainer):
 
         return output
 
-    def set_model_training_mode(self):
+    def set_model_training_mode(self, model):
         """
         设置各部分模型的训练模式，
         固定包含tts_model，a2f_model 可能包含 audio_feature_projector 与 tts的后续波形生成模块
-        # TODO：部分冻结的情况
+
+        设置模式直接 model.train() / model.eval() 即可，不必要再手动设置参数param.requires_grad = True / False
         """
         if self.train_config["train_tts"]:
             # TTS部分需要训练
-            self.model.tts_model.train()
-            for param in self.model.tts_model.parameters():
+            model.tts_model.train()
+            for param in model.tts_model.parameters():
                 param.requires_grad = True
         else:
             # TTS部分不需要训练，设置为eval模式并冻结
-            self.model.tts_model.eval()
-            for param in self.model.tts_model.parameters():
+            model.tts_model.eval()
+            for param in model.tts_model.parameters():
                 param.requires_grad = False
 
         if self.train_config["train_a2f"]:
             # A2F部分需要训练
-            self.model.a2f_model.train()
-            for param in self.model.a2f_model.parameters():
+            model.a2f_model.train()
+            for param in model.a2f_model.parameters():
                 param.requires_grad = True
             # 若同时存在音频特征投影层，也同步打开
             if hasattr(self.model, 'audio_feature_projector'):
@@ -502,8 +495,8 @@ class UniTAFTrainer(Trainer):
                     param.requires_grad = True
         else:
             # A2F部分不需要训练
-            self.model.a2f_model.eval()
-            for param in self.model.a2f_model.parameters():
+            model.a2f_model.eval()
+            for param in model.a2f_model.parameters():
                 param.requires_grad = False
             # 若同时存在音频特征投影层，也同步关闭
             if hasattr(self.model, 'audio_feature_projector'):
@@ -513,8 +506,8 @@ class UniTAFTrainer(Trainer):
 
         if "IndexTTS2" in self.train_config["tts_model"]:
             # IndexTTS2的s2mel部分始终冻结，不参与训练
-            self.model.s2mel.eval()  # 设置为eval模式
-            for param in self.model.s2mel.parameters():
+            model.s2mel.eval()  # 设置为eval模式
+            for param in model.s2mel.parameters():
                 param.requires_grad = False
 
     def create_optimizer(self):
@@ -588,171 +581,239 @@ class UniTAFTrainer(Trainer):
 
         a2f_loss同时依赖TTS和A2F，需要避免使用a2f_loss反传时，tts的梯度被清空
         """
-        # print(f"[training_step] model type={type(model).__name__}")  # type=DataParallel
-        # print(f"[training_step] model class={model.__class__}")  # class=<class 'torch.nn.parallel.data_parallel.DataParallel'>
-        # # 是不是被 accelerate 包过： 是
-        # if hasattr(model, "module"):
-        #     print(f"[training_step] model has .module -> wrapped by DistributedDataParallel / accelerate")
+        self.set_model_training_mode(model)  # 设置模型训练模式
+        if hasattr(self.optimizer, "train") and callable(self.optimizer.train):
+            self.optimizer.train()
 
-        self.set_model_training_mode()  # TODO： 放在main函数中而不是training_step
-
-        # 1. 前向
+        # 1. 前向并获得loss
         with self.compute_loss_context_manager():
             loss_dict = self.compute_losses(inputs)
 
-        # 在反向传播前，检查计算图
-        print("[DEBUG] 检查计算图连接")
-        # 检查TTS输出是否连接到A2F输入
-        if self.train_config["train_a2f"] and "tts_output" in loss_dict:
-            tts_output = loss_dict["tts_output"]  # 假设这是TTS的输出
-            print(f"TTS输出requires_grad: {tts_output.requires_grad}")
-            print(f"TTS输出grad_fn: {tts_output.grad_fn}")
-        # 检查A2F输入的grad_fn
-        for name, param in self.model.a2f_model.named_parameters():
-            if "audio_feature_map" in name or name.startswith("decoder."):
-                print(f"A2F参数 {name[:40]} grad_fn: {param.grad_fn}")
-                break
+        # # 在反向传播前，检查计算图 ------------------------------------------
+        # print("[training_step] 检查计算图连接")
+        # if self.train_config["train_a2f"] and "tts_mel_loss" in loss_dict:  # 检查TTS输出是否连接到A2F输入
+        #     tts_mel_loss = loss_dict["tts_mel_loss"]  # 假设这是TTS的输出
+        #     print(f"TTS输出requires_grad: {tts_mel_loss.requires_grad}")
+        #     print(f"TTS输出grad_fn: {tts_mel_loss.grad_fn}")
+        # # ---------------------------------------------------------------
 
         # 2. 计算各自 loss
         tts_loss = torch.tensor(0., device=self.device)
         a2f_loss = torch.tensor(0., device=self.device)
         if self.train_config["train_tts"]:
             if "IndexTTS2" in self.train_config["tts_model"]:
-                tts_loss = (
-                        self.train_config["IndexTTS2"]["text_loss_weight"] * loss_dict["tts_text_loss"] +
-                        self.train_config["IndexTTS2"]["mel_loss_weight"] * loss_dict["tts_mel_loss"])
+                tts_loss = (self.train_config["IndexTTS2"]["text_loss_weight"] * loss_dict["tts_text_loss"] +
+                            self.train_config["IndexTTS2"]["mel_loss_weight"] * loss_dict["tts_mel_loss"])
         if self.train_config["train_a2f"]:
             if "UniTalker" in self.train_config["a2f_model"]:
-                a2f_loss = (
-                        loss_dict["a2f_rec_loss"] +
-                        self.train_config["UniTalker"]["pca_weight"] * loss_dict["a2f_pca_loss"])
-        # print("[DEBUG] a2f_loss scalar=", a2f_loss.item())
-        total_loss = tts_loss + a2f_loss / self.train_config["grad_accumulation"]
+                a2f_loss = (loss_dict["a2f_rec_loss"] +
+                            self.train_config["UniTalker"]["pca_weight"] * loss_dict["a2f_pca_loss"])
+        total_loss = tts_loss + a2f_loss
+
+        # # 清除之前的梯度
+        # model.zero_grad(set_to_none=True)
 
         # 3. 各自反向
-        grad_clip = self.train_config["grad_clip"]
         use_amp = self.train_config["use_amp"] and torch.cuda.is_available()
 
         # 3-a TTS 反传
         if self.train_config["train_tts"] and tts_loss.item() != 0:
+
+            # 分离A2F相关参数，防止被TTS loss影响
+            if self.train_config["train_a2f"] and a2f_loss.item() != 0:
+                with torch.no_grad():
+                    a2f_grad_states = {}  # 备份A2F参数梯度状态
+                    for name, param in self.model.a2f_model.named_parameters():
+                        if param.requires_grad:
+                            a2f_grad_states[name] = param.grad
+
+            # tts反向传播
             if use_amp:
                 with torch.cuda.amp.autocast():
                     tts_loss.backward(retain_graph=True)  # 保留梯度给 A2F 用
             else:
                 tts_loss.backward(retain_graph=True)  # 保留梯度给 A2F 用
 
-            if grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(self.model.tts_model.parameters(), grad_clip)
+            # 恢复A2F梯度状态
+            if self.train_config["train_a2f"] and a2f_loss.item() != 0:
+                with torch.no_grad():
+                    for name, param in self.model.a2f_model.named_parameters():
+                        if param.requires_grad and name in a2f_grad_states:
+                            param.grad = a2f_grad_states[name]
 
-            # # 打印 TTS 梯度 ， TTS全部层都正常有梯度
-            # print("[DEBUG] TTS grad sample:")
-            # for name, p in self.model.tts_model.named_parameters():
+            # # 打印 TTS 梯度 ---------------------------------------------------
+            # print("[training_step] TTS grad sample:")
+            # for name, p in model.tts_model.named_parameters():
             #     if p.grad is not None:
             #         print("✅", name[:60], p.grad.norm().item())
-
+            # # ----------------------------------------------------------------
 
         # 3-b A2F 反传
         if self.train_config["train_a2f"] and a2f_loss.item() != 0:
+            # a2f反向传播
             if use_amp:
                 with torch.cuda.amp.autocast():
-                    a2f_loss.backward(retain_graph=True)  # A2F 最后一次，不需要再 retain graph
+                    a2f_loss.backward()  # A2F 最后一次，不需要再 retain graph
             else:
-                a2f_loss.backward(retain_graph=True)  # A2F 最后一次，不需要再 retain graph
+                a2f_loss.backward()  # A2F 最后一次，不需要再 retain graph
 
-            if grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(self.model.a2f_model.parameters(), grad_clip)
-
-            # ===== 打印 A2F 梯度 =====
-            # print("[DEBUG] A2F grad sample:")
-            # for name, p in self.model.a2f_model.named_parameters():
+            # # 打印 A2F 梯度 ---------------------------------------------------
+            # print("[training_step] A2F grad sample:")
+            # for name, p in model.a2f_model.named_parameters():
             #     if p.grad is not None:
-            #         print("✅", name[:60], p.grad.norm().item())  # ✅ decoder.learnable_style_emb.weight 0.0
-            #         # print("✅", name[:60],
-            #         #       "grad_norm=", p.grad.norm().item(),  # 0
-            #         #       "grad_max=", p.grad.abs().max().item(),  # 0
-            #         #       "grad_mean=", p.grad.mean().item())  # 0
-            #         # break
-            '''
-            只有最后两层有梯度
-            ✅ decoder.learnable_style_emb.weight 0.0
-            ✅ decoder.audio_feature_map.weight 0.0
-            ✅ decoder.audio_feature_map.bias 0.0
-            ✅ decoder.tcn.first_net.conv_layers.0.residual_layer.0.weight 0.0
-            ✅ decoder.tcn.first_net.conv_layers.0.residual_layer.0.bias 0.0
-            ✅ decoder.tcn.first_net.conv_layers.0.conv.weight 0.0
-            ✅ decoder.tcn.first_net.conv_layers.0.conv.bias 0.0
-            ✅ decoder.tcn.first_net.conv_layers.0.norm.weight 0.0
-            ✅ decoder.tcn.first_net.conv_layers.0.norm.bias 0.0
-            ✅ decoder.tcn.first_net.conv_layers.1.conv.weight 0.0
-            ✅ decoder.tcn.first_net.conv_layers.1.conv.bias 0.0
-            ✅ decoder.tcn.first_net.conv_layers.1.norm.weight 0.0
-            ✅ decoder.tcn.first_net.conv_layers.1.norm.bias 0.0
-            ✅ decoder.tcn.first_net.conv_layers.2.conv.weight 0.0
-            ✅ decoder.tcn.first_net.conv_layers.2.conv.bias 0.0
-            ✅ decoder.tcn.first_net.conv_layers.2.norm.weight 0.0
-            ✅ decoder.tcn.first_net.conv_layers.2.norm.bias 0.0
-            ✅ out_head_dict.qxsk_inhouse_blendshape_weight.weight 0.2685113847255707
-            ✅ out_head_dict.qxsk_inhouse_blendshape_weight.bias 6.778741953894496e-05
-            '''
+            #         print("✅", name[:60], p.grad.norm().item())
+            # # ----------------------------------------------------------------
 
-            # # ===== 全量扫描 A2F 梯度 =====
-            # print("[DEBUG] A2F 全梯度扫描（backward 后）")
-            # zero_count = 0
+            # ===== 立刻检查 A2F 梯度 =====
+            # print("[training_step] A2F 梯度统计")
+            # total, zero, tiny = 0, 0, 0
             # for name, p in self.model.a2f_model.named_parameters():
             #     if p.grad is None:
-            #         continue  # 跳过无图
+            #         continue
+            #     total += 1
             #     g_norm = p.grad.norm().item()
-            #     if g_norm == 0.0:
-            #         zero_count += 1
-            #         print(f"❌ ZERO  {name[:70]}  norm={g_norm}")
-            #     elif g_norm < 1e-7:
-            #         print(f"⚠️ 极小 {name[:70]}  norm={g_norm}")
-            #     else:
-            #         # 只打印第一条非零梯度，作为「图连通」证据
-            #         if zero_count == 0:
-            #             print(f"✅ OK    {name[:70]}  norm={g_norm}")
-            # print(f"[DEBUG] A2F 中 norm=0 的参数共 {zero_count} 个")
-
-            # param = model.a2f_model.decoder.learnable_style_emb.weight
-            # print("requires_grad:", param.requires_grad)  # 必须 True ： True
-            # print("is_leaf:", param.is_leaf)  # 必须 True ： True
-            # print("grad_fn:", param.grad_fn)  # 必须存在 ： None
+            #     if g_norm == 0:
+            #         zero += 1
+            #     elif g_norm < 1e-6:
+            #         tiny += 1
+            # print(f"A2F 总参数 {total} | 零梯度 {zero} | 极小梯度 {tiny}")  # A2F 总参数 19 | 零梯度 0 | 极小梯度 0
 
 
-        # 4. 各自 step（Trainer 会在外面再调一次，我们把它覆盖掉）
-        #    注意：Trainer 默认在 optimizer.step() 里会把所有优化器都 step，
-        #    所以这里我们先 step 完，把梯度清掉，后面 Trainer 再调一次时梯度为 0 就不会重复更新。
-        if self.train_config["train_tts"] and tts_loss.item() != 0:
-            opt_tts = self.optimizer.optimizers[0]
-            opt_tts.step()
-            opt_tts.zero_grad(set_to_none=True)
+        # 4. 梯度裁剪
+        grad_clip = self.train_config.get("grad_clip", 0)
+        if grad_clip > 0:
+            if self.train_config["train_tts"]:
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.tts_model.parameters(),
+                    grad_clip
+                )
+            if self.train_config["train_a2f"]:
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.a2f_model.parameters(),
+                    grad_clip
+                )
 
-        if self.train_config["train_a2f"] and a2f_loss.item() != 0:
-            # 当 train_tts=False 时 a2f 优化器是第 0 个
+        # # ===== 全量扫描 A2F 梯度 =====
+        # print("[DEBUG] A2F 全梯度扫描（backward 后）")
+        # zero_count = 0
+        # for name, p in self.model.a2f_model.named_parameters():
+        #     if p.grad is None:
+        #         continue  # 跳过无图
+        #     g_norm = p.grad.norm().item()
+        #     if g_norm == 0.0:
+        #         zero_count += 1
+        #         print(f"❌ ZERO  {name[:70]}  norm={g_norm}")
+        #     elif g_norm < 1e-7:
+        #         print(f"⚠️ 极小 {name[:70]}  norm={g_norm}")
+        #     else:
+        #         # 只打印第一条非零梯度，作为「图连通」证据
+        #         if zero_count == 0:
+        #             print(f"✅ OK    {name[:70]}  norm={g_norm}")
+        # print(f"[DEBUG] A2F 中 norm=0 的参数共 {zero_count} 个")
+
+        # 5. 只在需要的时候启用对应优化器的参数  # TODO：需不需要再training_step中控制
+        if not self.train_config["train_tts"]:
+            # 禁用TTS优化器
+            for param_group in self.optimizer.optimizers[0].param_groups:
+                for param in param_group['params']:
+                    param.requires_grad = False
+
+        if not self.train_config["train_a2f"]:
+            # 禁用A2F优化器
             idx = 1 if self.train_config["train_tts"] else 0
-            opt_a2f = self.optimizer.optimizers[idx]
-            opt_a2f.step()
-            opt_a2f.zero_grad(set_to_none=True)
+            for param_group in self.optimizer.optimizers[idx].param_groups:
+                for param in param_group['params']:
+                    param.requires_grad = False
 
-        # print("[DEBUG] LR:", self.lr_scheduler.get_last_lr())  # [[2e-05], [2e-05]]
+        # 6. 将各个模块的loss也记录到日志中
+        if (self.state.global_step + 1 ) % self.args.logging_steps == 0:
+            log_dict = {}  # 先收集 loss_dict 里所有叶子标量
+
+            def _collect(key, val):
+                if isinstance(val, dict):
+                    for k, v in val.items():
+                        _collect(f"{key}_{k}", v)
+                elif isinstance(val, torch.Tensor) and val.numel() == 1:
+                    log_dict[key] = val.detach().item()
+                elif isinstance(val, (int, float)):
+                    log_dict[key] = float(val)
+
+            for k, v in loss_dict.items():
+                _collect(k, v)
+            # 再加加权 loss
+            log_dict["tts_loss"] = tts_loss.detach().item()
+            log_dict["a2f_loss"] = a2f_loss.detach().item()
+            # 一次发给 Trainer（它会自动加前缀 train_ ）
+            self.log(log_dict)
+
         return total_loss.detach()      # 返回标量给 Trainer 做日志
 
-    # TODO：梯度裁剪适合用哪个？
-    def clip_gradients(self, parameters, max_norm, optimizer):
-        """ Trainer 会在 optimizer.step 前自动调用 """
-        # 这里直接调用官方实现即可
-        torch.nn.utils.clip_grad_norm_(parameters, max_norm)
-
     def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval"):
-        """占位：只返回空 dict，后续再填具体指标"""
-        # TODO
-        return {}
+        """
+        覆盖Trainer.evaluate，遍历一遍eval_dataset并收集评估指标（主要是各个部分的loss）
+        """
+        # 1. 准备模型和验证集
+        eval_dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
+        if eval_dataset is None:
+            raise ValueError("evaluate 时需要 eval_dataset")
+        eval_dataloader = self.get_eval_dataloader(eval_dataset)
 
-    # TODO:尚未验证加载保存的权重是否有误，训练中加载保存的权重/推理中加载保存的权重（推理脚本未实现）
+        self.model.eval()
+
+        # meter_names = ["tts_loss", "a2f_loss", "total_loss"]  # 初始这三个指标，后根据返回的loss_dict扩容
+        meters = defaultdict(AverageMeter)
+
+        # 2. 遍历验证集
+        for batch in tqdm(eval_dataloader, desc=f"Eval bsz={self.args.eval_batch_size}"):
+            '''
+            在eval_dataloader中获取到的batch是已经经过collate_batch的已经处理成模型输入的了
+            '''
+            # 2.1 前向并获得loss
+            with self.compute_loss_context_manager():
+                loss_dict = self.compute_losses(batch)
+
+            # 2.2 计算各自 loss
+            tts_loss = torch.tensor(0., device=self.device)
+            a2f_loss = torch.tensor(0., device=self.device)
+            if self.train_config["train_tts"]:
+                if "IndexTTS2" in self.train_config["tts_model"]:
+                    tts_loss = (self.train_config["IndexTTS2"]["text_loss_weight"] * loss_dict["tts_text_loss"] +
+                                self.train_config["IndexTTS2"]["mel_loss_weight"] * loss_dict["tts_mel_loss"])
+            if self.train_config["train_a2f"]:
+                if "UniTalker" in self.train_config["a2f_model"]:
+                    a2f_loss = (loss_dict["a2f_rec_loss"] +
+                                self.train_config["UniTalker"]["pca_weight"] * loss_dict["a2f_pca_loss"])
+            total_loss = tts_loss + a2f_loss
+
+            # 2.3 记录所有标量
+            for k, v in loss_dict.items():  # 添加loss_dict中所有量
+                if isinstance(v, torch.Tensor) and v.numel() == 1:
+                    meters[k].update(v.item())
+                elif isinstance(v, dict):  # 处理嵌套 dict，例如 tts_metrics
+                    for sub_k, sub_v in v.items():
+                        if isinstance(sub_v, (int, float, torch.Tensor)):
+                            meters[f"{k}_{sub_k}"].update(float(sub_v))
+            # 添加加权 loss
+            bsz = batch["face_data"].size(0)
+            meters["tts_loss"].update(tts_loss.item(), bsz)
+            meters["a2f_loss"].update(a2f_loss.item(), bsz)
+            meters["total_loss"].update(total_loss.item(), bsz)
+
+        # 4. 加前缀 & 过滤
+        metrics = {}
+        for k, meter in meters.items():
+            if ignore_keys and k in ignore_keys:
+                continue
+            metrics[f"{metric_key_prefix}_{k}"] = meter.avg
+
+        self.log(metrics)
+        return metrics
+
     def _save_checkpoint(self, model, trial, metrics=None):
         '''
         重写Trainer._save_checkpoint()保存逻辑
         只保存UniTAF.state_dict()实现的指定的部分模块权重
+        # TODO:尚未验证加载保存的权重是否有误，训练中加载保存的权重/推理中加载保存的权重（推理脚本未实现）
         '''
         from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR  # "checkpoint"
         output_dir = os.path.join(self.args.output_dir,
@@ -782,34 +843,6 @@ class UniTAFTrainer(Trainer):
         else:
             super()._save_checkpoint(model, trial)
 
-    def log_validation(self, metrics, step):
-        """占位：把验证指标打印出来，后续可接 wandb"""
-        # TODO
-        print(f"[Validation @ step {step}] {metrics}")
-
-    # 在训练开始时调用
-    def check_model_status(self):
-        print("\n=== 模型参数状态检查 ===")
-
-        # 检查所有模型的requires_grad状态
-        models_to_check = [
-            ("tts_model", self.model.tts_model),
-            ("a2f_model", self.model.a2f_model),
-            ("audio_feature_projector", self.model.audio_feature_projector),
-        ]
-
-        for name, model in models_to_check:
-            if hasattr(self.model, name):
-                trainable = sum(p.requires_grad for p in model.parameters())
-                total = sum(1 for _ in model.parameters())
-                print(f"{name:25} 可训练参数: {trainable}/{total}")
-
-                # 如果可训练参数为0，列出具体哪些层被冻结
-                if trainable == 0 and total > 0:
-                    print(f"  ⚠️ {name}所有参数都被冻结!")
-                    for n, p in model.named_parameters():
-                        print(f"    {n}: requires_grad={p.requires_grad}")
-
 def setup_dataset(train_config):  # 支持多数据集训练，对应unitaf_dataset_support_config中具体数据集
     '''
     在这里为每个dataset 例如"D11","D12" ;以及为每个dataset_type 例如"train","val"，都创建数据集并合并
@@ -831,12 +864,12 @@ def setup_dataset(train_config):  # 支持多数据集训练，对应unitaf_data
             train_dataset = UniTAFDataset(dataset_config, dataset_name=subdataset, dataset_type="train")
             train_datasets.append(train_dataset)
         except Exception as e:
-            print(f"[UniTAFTrainer][setup_dataloader] 数据集{subdataset}没有train训练集，跳过。\n Error:{e}")
+            print(f"[UniTAFTrainer][setup_dataset] 数据集{subdataset}没有train训练集，跳过。\n Error:{e}")
         try:
             val_dataset = UniTAFDataset(dataset_config, dataset_name=subdataset, dataset_type="val")
             val_datasets.append(val_dataset)
         except Exception as e:
-            print(f"[UniTAFTrainer][setup_dataloader] 数据集{subdataset}没有val验证集，跳过。\n Error:{e}")
+            print(f"[UniTAFTrainer][setup_dataset] 数据集{subdataset}没有val验证集，跳过。\n Error:{e}")
 
     # 3. 合并dataset
     if len(train_datasets) > 1:
@@ -887,7 +920,7 @@ if __name__ == '__main__':
     python unitaf_train/train_unitaf.py 
     '''
     # 设置使得Trainer限制在固定卡上
-    os.environ["CUDA_VISIBLE_DEVICES"] = "1"  # 只用第 1 号卡，此时会从可见卡开始编码cuda:0,cuda:1...
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # 只用第 1 号卡，此时会从可见卡开始编码cuda:0,cuda:1...
 
     train_config = {
         # 模型类型，这里用于指导训练器类训练哪些模型
@@ -925,34 +958,32 @@ if __name__ == '__main__':
             # （UniTalker本身还有一个 a2f/dataset/dataset_config 记录UniTalker Decoder支持的数据集，
             # 但我们只会以 unitaf_dataset_support_config 为准）
         },
-        # dataloader设置
-        "num_workers": 2,
         # 设备
         "device": "cuda:0",  # 注: 需要与外部的CUDA_VISIBLE_DEVICES一致!但只有一个可见卡时，硬编码则应该是cuda：0
         # 训练设置-------------------------------------------------------------------------------------------------------
         "batch_size": 2,
-        "epochs": 2,
+        "epochs": 20,
         "grad_accumulation": 1,
         "grad_clip": 1.0,
         "use_amp": True,
         "warmup_steps": 0, # 所有调度器统一参数 warmup 为50
         "log_interval": 5,  # training_step 里打印 loss 的步长
         "val_interval": 30,  # 每隔多少 step 做一次验证
-        "save_interval": 50,  # 每隔多少 step 存一次 ckpt  TODO：保存时遇到张量不连续问题
+        "save_interval": 500000,  # 每隔多少 step 存一次 ckpt
         "output_dir": "./unitaf_ckpt",  # 断点 & 日志保存根目录
         "resume_path": None,  # 如需断点续训，填 ckpt 路径或 True
         # 分别训练tts和a2f的配置
-        "train_tts": True,
+        "train_tts": False,
         "train_a2f": True,  # 只要训练a2f,则必须训练audio feature projector. 故不在额外增加投影层是否训练的参数判断了
         # 优化器设置，为不同模块设置不同优化器
         "tts_train_cfg": {
-            "lr": 2e-5,
+            "lr": 1e-3,
             "betas": (0.9, 0.999),
             "weight_decay": 0.01,
             "eps": 1e-08,
         },
         "a2f_train_cfg": {
-            "lr": 2e-5,
+            "lr": 1e-3,
             "betas": (0.9, 0.999),
             "weight_decay": 0.01,
             "eps": 1e-08,

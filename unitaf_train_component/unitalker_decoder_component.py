@@ -22,6 +22,13 @@ from a2f.models.base_model import BaseModel
 from a2f.models.unitalker import OutHead
 from unitaf_train.unitaf_dataset_support_config import unitaf_dataset_support_config
 
+# ---------- 梯度钩子：逐层打印范数 ----------
+def hook_fn(name):
+    def fn(grad):
+        gnorm = grad.norm().item() if grad is not None else 0.0
+        print(f'{name:40s} grad_norm = {gnorm:.8f}')
+        return grad      # 必须返回，否则梯度传不下去
+    return fn
 
 class UniTalkerDecoder(BaseModel):
     def __init__(self, cfg):  # cfg需要使用OmegaConf读取，同时具备属性和字典调用方式
@@ -72,9 +79,21 @@ class UniTalkerDecoder(BaseModel):
             if self.model_cfg["headlayer"] == 1:
                 # 单层线性输出头
                 out_projection = nn.Linear(self.model_cfg["decoder_dimension"], out_dim)
-                # 初始化权重和偏置为零
-                nn.init.constant_(out_projection.weight, 0)
-                nn.init.constant_(out_projection.bias, 0)
+                '''
+                一般情况下直接加载对应输出头的预训练权重，但我们训练时是一个新的数据集（新的输出头）
+                这里官方做法是初始化新输出头的out_projection权重为和偏置为0，不知道为什么官方要这么做，
+                但是这样会导致a2f部分的梯度在此处中断。
+                于是我们采用下面的 Xavier初始化。
+                '''
+                # # 初始化权重和偏置为零
+                # nn.init.constant_(out_projection.weight, 0)
+                # nn.init.constant_(out_projection.bias, 0)
+
+                # 统一 Xavier 初始化
+                nn.init.xavier_normal_(out_projection.weight, gain=1.0)
+                nn.init.zeros_(out_projection.bias)  # bias 可以保留 0
+
+                # print(f"UniTalkerDecoder 输出头权重：out_projection.weight{out_projection.weight}")
             else:
                 # 多层输出头
                 out_projection = OutHead(self.model_cfg, out_dim)
@@ -83,6 +102,17 @@ class UniTalkerDecoder(BaseModel):
         self.out_head_dict = nn.ModuleDict(out_head_dict)
 
         self.loss_module = None  # 正常不加载Loss计算模块，如果使用到再加载
+
+        # # ---- 确认每个输出头都已非零 ----
+        # print("UniTalkerDecoder\n")
+        # for name, module in self.out_head_dict.items():
+        #     if hasattr(module, 'weight'):  # 单层 Linear
+        #         w_mean = module.weight.abs().mean().item()
+        #         print(f'[init check] {name:10s} weight absmean = {w_mean:.6f}')
+        #     else:  # 多层 OutHead
+        #         first_linear = list(module.modules())[1]  # 取出第一个 Linear
+        #         w_mean = first_linear.weight.abs().mean().item()
+        #         print(f'[init check] {name:10s} (OutHead) weight absmean = {w_mean:.6f}')
 
     # UniTalker Decoder前向过程
     def forward(
@@ -144,6 +174,9 @@ class UniTalkerDecoder(BaseModel):
                     face_motion - template, self.pca_dim)
             else:
                 gt_pca = None
+
+        # print('out_head weight absmean=', self.out_head_dict[annot_type].weight.abs().mean().item(),
+        #       'bias absmean=', self.out_head_dict[annot_type].bias.abs().mean().item())
 
         # print("[UniTalker Decoder] out_motion.shape", out_motion.shape)  # torch.Size([16, 240, 61])
 
