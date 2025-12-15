@@ -10,15 +10,6 @@ UniTAFTrainer继承使用transformers Trainer类。
 
 - 期望实现为模型中tts模块和a2f分别应用各自的loss进行更新。故而：
     尝试重写create_optimizer和create_scheduler为每个模块生成单独的优化器和调度器（创建配置需要根据UniTAFTrainer.train_config）
-    并在training_step()中手动完成各自反向，各自更新也由我们手动opt.step()。Trainer只负责调用 training_step，写日志，验证，保存，不会多管闲事。
-
-    Optimizer 只能看到「参数 + 参数的 .grad 字段」，它永远把当前 .grad 当成“最终梯度”去做更新。
-    如果我们想让 optimizer 自己决定用哪部分梯度”，就必须在反向之前把两份梯度拼到同一份 .grad 上。
-    这等于又回到了“先各自反传、再各自 step”的复杂度，甚至更难维护：
-        这需要分别保存tts_loss与a2f_loss到临时的buffer，把两份梯度手动写回对应参数的 .grad ,再让 optimizer 去做一次统一step；
-        同时还要处理 retain_graph=True, AMP, 梯度累积, 裁剪, zero_grad的时机。
-
-    因此在 training_step里手动各自 backward; 直接调用各自 optimizer.step();
 
 整个UniTAFTrainer的作用是训练 tts模块和 a2f(包含projector)模块。
 我们为tts和a2f分别创建optimizor，并在training_step中手动分别更新两个部分。
@@ -94,9 +85,10 @@ class MultiOptimizer:
     def __init__(self, optimizers):
         self.optimizers = optimizers
 
-    def step(self):
-        """我们已经在外面 step 过了，这里什么都不做"""
-        pass
+    def step(self, closure=None):
+        """执行每个optimizer的step"""
+        for i, opt in enumerate(self.optimizers):
+            opt.step(closure)  # 原来的逻辑
 
     def zero_grad(self, set_to_none=True):
         """清零所有优化器的梯度"""
@@ -119,10 +111,8 @@ class MultiScheduler:
 
     def step(self):
         """执行所有调度器的step"""
-        # for scheduler in self.schedulers:
-        #     scheduler.step()
-        # 我们已经在training_step手工操作过了
-        pass
+        for scheduler in self.schedulers:
+            scheduler.step()
 
     def get_last_lr(self):
         """获取所有调度器的学习率"""
@@ -147,6 +137,10 @@ class UniTAFTrainer(Trainer):
     def __init__(self, train_config, model, device, train_dataset, val_dataset):
         self.train_config = train_config
         self.device = device
+
+        # 是否为TTS模块添加LoRA
+        if self.train_config["train_tts"] and self.train_config["train_tts_lora"]:
+            model = self.apply_lora_to_tts(model)
 
         super().__init__(
             model=model,
@@ -465,6 +459,27 @@ class UniTAFTrainer(Trainer):
 
         return output
 
+    def apply_lora_to_tts(self, model):
+        '''
+        训练tts且使用LoRA训练时，返回peft model
+        '''
+        from peft import LoraConfig, get_peft_model
+
+        assert self.train_config["train_tts"] == True and self.train_config["train_tts_lora"] == True
+        # 只给 TTS 模型加 LoRA
+        lora_config = LoraConfig(
+            r=self.train_config["tts_lora_cfg"].get("lora_rank", 16),
+            lora_alpha=self.train_config["tts_lora_cfg"].get("lora_alpha", 32),
+            target_modules=self.train_config["tts_lora_cfg"].get("lora_target_modules"),
+            lora_dropout=self.train_config["tts_lora_cfg"].get("lora_dropout", 0.1),
+            bias="none",
+            task_type="FEATURE_EXTRACTION",  # 或无特定任务
+        )
+
+        model.tts_model = get_peft_model(model.tts_model, lora_config)
+        model.tts_model.print_trainable_parameters()  # 打印 LoRA 参数量
+        return model
+
     def set_model_training_mode(self, model):
         """
         设置各部分模型的训练模式，
@@ -473,10 +488,15 @@ class UniTAFTrainer(Trainer):
         设置模式直接 model.train() / model.eval() 即可，不必要再手动设置参数param.requires_grad = True / False
         """
         if self.train_config["train_tts"]:
-            # TTS部分需要训练
             model.tts_model.train()
-            for param in model.tts_model.parameters():
-                param.requires_grad = True
+            if self.train_config["train_tts_lora"]:
+                # TTS-LoRA部分需要训练
+                for name, param in model.tts_model.named_parameters():
+                    param.requires_grad = ("lora_" in name)
+            else:
+                # TTS部分需要训练
+                for param in model.tts_model.parameters():
+                    param.requires_grad = True
         else:
             # TTS部分不需要训练，设置为eval模式并冻结
             model.tts_model.eval()
@@ -610,6 +630,10 @@ class UniTAFTrainer(Trainer):
                             self.train_config["UniTalker"]["pca_weight"] * loss_dict["a2f_pca_loss"])
         total_loss = tts_loss + a2f_loss
 
+        print('[DEBUG] tts_text_loss.requires_grad:', loss_dict["tts_text_loss"].requires_grad)
+        print('[DEBUG] tts_mel_loss.requires_grad :', loss_dict["tts_mel_loss"].requires_grad)
+        print('[DEBUG] tts_loss.requires_grad     :', tts_loss.requires_grad, tts_loss.grad_fn)
+
         # # 清除之前的梯度
         # model.zero_grad(set_to_none=True)
 
@@ -619,13 +643,20 @@ class UniTAFTrainer(Trainer):
         # 3-a TTS 反传
         if self.train_config["train_tts"] and tts_loss.item() != 0:
 
-            # 分离A2F相关参数，防止被TTS loss影响
-            if self.train_config["train_a2f"] and a2f_loss.item() != 0:
-                with torch.no_grad():
-                    a2f_grad_states = {}  # 备份A2F参数梯度状态
-                    for name, param in self.model.a2f_model.named_parameters():
-                        if param.requires_grad:
-                            a2f_grad_states[name] = param.grad
+            # # 分离A2F相关参数，防止被TTS loss影响
+            # if self.train_config["train_a2f"] and a2f_loss.item() != 0:
+            #     with torch.no_grad():
+            #         a2f_grad_states = {}  # 备份A2F参数梯度状态
+            #         for name, param in self.model.a2f_model.named_parameters():
+            #             if param.requires_grad:
+            #                 a2f_grad_states[name] = param.grad
+
+            # 打印 TTS 梯度 ---------------------------------------------------
+            print("[training_step] TTS grad sample:")
+            for name, p in model.tts_model.named_parameters():
+                if p.grad is not None:
+                    print("✅", name[:60], p.grad.norm().item())
+            # ----------------------------------------------------------------
 
             # tts反向传播
             if use_amp:
@@ -711,21 +742,7 @@ class UniTAFTrainer(Trainer):
         #             print(f"✅ OK    {name[:70]}  norm={g_norm}")
         # print(f"[DEBUG] A2F 中 norm=0 的参数共 {zero_count} 个")
 
-        # 5. 只在需要的时候启用对应优化器的参数  # TODO：需不需要再training_step中控制
-        if not self.train_config["train_tts"]:
-            # 禁用TTS优化器
-            for param_group in self.optimizer.optimizers[0].param_groups:
-                for param in param_group['params']:
-                    param.requires_grad = False
-
-        if not self.train_config["train_a2f"]:
-            # 禁用A2F优化器
-            idx = 1 if self.train_config["train_tts"] else 0
-            for param_group in self.optimizer.optimizers[idx].param_groups:
-                for param in param_group['params']:
-                    param.requires_grad = False
-
-        # 6. 将各个模块的loss也记录到日志中
+        # 5. 将各个模块的loss也记录到日志中
         if (self.state.global_step + 1 ) % self.args.logging_steps == 0:
             log_dict = {}  # 先收集 loss_dict 里所有叶子标量
 
@@ -745,6 +762,14 @@ class UniTAFTrainer(Trainer):
             log_dict["a2f_loss"] = a2f_loss.detach().item()
             # 一次发给 Trainer（它会自动加前缀 train_ ）
             self.log(log_dict)
+
+        # # ===== 训练步末尾：打印同一层权重，确保参数有更新 =====
+        # if self.state.global_step % self.args.logging_steps == 0:
+        #     # 选一条“代表层”即可
+        #     p = self.model.a2f_model.decoder.tcn.first_net.conv_layers[0].conv.weight[0, :5]  # 只取前 5 维，防止刷屏
+        #     print(f"[step={self.state.global_step}] "
+        #           f"style_emb[0,:5] = {p.detach().cpu().tolist()}  "
+        #           f"grad_norm = {p.grad.norm().item() if p.grad is not None else 'None'}")
 
         return total_loss.detach()      # 返回标量给 Trainer 做日志
 
@@ -823,7 +848,13 @@ class UniTAFTrainer(Trainer):
         # 1. TTS 权重
         if hasattr(model, 'tts_model') and any(p.requires_grad for p in model.tts_model.parameters()):
             tts_path = os.path.join(output_dir, "tts_model.bin")
-            torch.save(model.tts_model.state_dict(), tts_path)
+            # 如果是LoRA训练
+            if hasattr(model.tts_model, 'merge_and_unload'):   # PeftModel 的标志
+                merged = model.tts_model.merge_and_unload()    # 合并后的 base_model
+                torch.save(merged.state_dict(), tts_path)
+                del merged                                     # 释放显存
+            else:
+                torch.save(model.tts_model.state_dict(), tts_path)
 
         # 2. A2F 权重（不含 loss_module）
         if hasattr(model, 'a2f_model') and any(p.requires_grad for p in model.a2f_model.parameters()):
@@ -888,7 +919,7 @@ def main(train_config):
     train_dataset, val_dataset = setup_dataset(train_config)
     total_steps = len(train_dataset) * train_config["epochs"] // train_config["grad_accumulation"]
 
-    # 2. 实例化模型（Trainer 需要）
+    # 2. 实例化基础联合模型（Trainer 需要）
     device = torch.device(train_config["device"] if torch.cuda.is_available() else "cpu")
     model = UniTextAudioFaceModel(cfg=train_config, device=device)
 
@@ -920,7 +951,7 @@ if __name__ == '__main__':
     python unitaf_train/train_unitaf.py 
     '''
     # 设置使得Trainer限制在固定卡上
-    os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # 只用第 1 号卡，此时会从可见卡开始编码cuda:0,cuda:1...
+    os.environ["CUDA_VISIBLE_DEVICES"] = "4"  # 只用第 1 号卡，此时会从可见卡开始编码cuda:0,cuda:1...
 
     train_config = {
         # 模型类型，这里用于指导训练器类训练哪些模型
@@ -967,23 +998,30 @@ if __name__ == '__main__':
         "grad_clip": 1.0,
         "use_amp": True,
         "warmup_steps": 0, # 所有调度器统一参数 warmup 为50
-        "log_interval": 5,  # training_step 里打印 loss 的步长
-        "val_interval": 30,  # 每隔多少 step 做一次验证
-        "save_interval": 500000,  # 每隔多少 step 存一次 ckpt
+        "log_interval": 20,  # training_step 里打印 loss 的步长
+        "val_interval": 500,  # 每隔多少 step 做一次验证
+        "save_interval": 2,  # 每隔多少 step 存一次 ckpt
         "output_dir": "./unitaf_ckpt",  # 断点 & 日志保存根目录
         "resume_path": None,  # 如需断点续训，填 ckpt 路径或 True
         # 分别训练tts和a2f的配置
-        "train_tts": False,
-        "train_a2f": True,  # 只要训练a2f,则必须训练audio feature projector. 故不在额外增加投影层是否训练的参数判断了
+        "train_tts": True,
+        "train_tts_lora": True,
+        "train_a2f": False,  # 只要训练a2f,则必须训练audio feature projector. 故不在额外增加投影层是否训练的参数判断了
         # 优化器设置，为不同模块设置不同优化器
         "tts_train_cfg": {
-            "lr": 1e-3,
+            "lr": 2e-4,
             "betas": (0.9, 0.999),
             "weight_decay": 0.01,
             "eps": 1e-08,
         },
+        "tts_lora_cfg": {
+            "lora_target_modules": ["c_attn", "c_proj"],  # 只针对TTS中gpt
+            "lora_rank": 64,
+            "lora_alpha": 64,
+            "lora_dropout": 0.0,
+        },
         "a2f_train_cfg": {
-            "lr": 1e-3,
+            "lr": 1e-4,
             "betas": (0.9, 0.999),
             "weight_decay": 0.01,
             "eps": 1e-08,
