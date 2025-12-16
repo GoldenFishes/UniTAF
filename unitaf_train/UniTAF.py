@@ -12,6 +12,7 @@ from omegaconf import OmegaConf
 import sys
 import os
 from pathlib import Path
+from omegaconf import OmegaConf
 from typing import Dict, List, Optional, Sequence, Set, Tuple, Any
 
 import torch
@@ -34,6 +35,9 @@ class UniTextAudioFaceModel(nn.Module):
         # 训练模式下，一些组件在dataset中加载，主干加载需要训练的模块
         if mode == 'train':
             if "IndexTTS2" in cfg["tts_model"]:
+                '''
+                在训练过程中,self.tts_model为核心的自回归transformer模型，前置的音频encoder大部分放在dataset中进行预处理。
+                '''
                 # 导入IndexTTS2组件
                 from indextts.utils.front import TextNormalizer, TextTokenizer
                 # 初始化文本tokenizer
@@ -63,6 +67,73 @@ class UniTextAudioFaceModel(nn.Module):
                 if "IndexTTS2" in cfg["tts_model"]:
                     self.audio_feature_projector = self.build_audio_feature_projector(in_dim=1024, out_dim=1024)
 
+        # 推理模式下
+        if mode == 'inference':
+            if "IndexTTS2" in cfg["tts_model"]:
+                '''
+                推理模式下self.tts_model对应整个IndexTTS2，其中我们训练的核心自回归transformer权重应当替换加载self.tts_model.gpt
+                '''
+                self.tts_model = self.build_inference_indextts2_model()  # 在UniTAFIndexTTS2中就已经预设好训练模式了
+
+            if "UniTalker" in cfg["a2f_model"]:
+                # 尝试获取配置文件中a2f微调权重,如果没有,则载入预训练的权重
+                ckpt = self.cfg.get("finetune_checkpoint", {}).get("a2f_model") or "a2f/pretrained_models/UniTalker-L-D0-D7.pt"
+                # 加载UniTalker Decoder并保存权重
+                self.a2f_model = self.build_unitalker_decoder_model(
+                    cfg=cfg,
+                    checkpoint=Path(ckpt),
+                    device=device,
+                )
+                self.a2f_model.eval()
+                # 如果同时存在UniTalker和IndexTTS2,则初始化中间特征的投影层
+                if "IndexTTS2" in cfg["tts_model"]:
+                    self.audio_feature_projector = self.build_audio_feature_projector(in_dim=1024, out_dim=1024)
+                    self.audio_feature_projector.eval()
+
+    # TODO
+    def indextts2_unitalker_inference(self, spk_audio_prompt, text, output_path,
+              emo_audio_prompt=None, emo_alpha=1.0,
+              emo_vector=None,
+              use_emo_text=False, emo_text=None, use_random=False, interval_silence=200,
+              verbose=False, max_text_tokens_per_segment=120, stream_return=False, more_segment_before=0, **generation_kwargs):
+        '''
+        UniTAF联合模型的推理流程，接收所有原始IndexTTS2的参数
+        '''
+        # 必须是IndexTTS2与UniTalker Decoder的联合模型的推理模式
+        assert "IndexTTS2" in self.cfg["tts_model"] and "UniTalker" in self.cfg["a2f_model"]
+        assert self.mode == "inference"
+
+        tts_gen = self.tts_model.infer(spk_audio_prompt, text,
+              emo_audio_prompt, emo_alpha,
+              emo_vector,
+              use_emo_text, emo_text, use_random, interval_silence,
+              verbose, max_text_tokens_per_segment, stream_return, more_segment_before, **generation_kwargs)
+
+        # 取最后一次 yield 的值
+        for sr, wav_data, audio_feature in tts_gen:  # 循环会一次性跑完，循环变量留下最后一次的值
+            pass
+
+        print(sr)  # 22050
+        print(wav_data.shape)  # (N, 1)  int16
+        print(audio_feature.shape)  # (1, T, 1024)
+
+
+        if output_path: # TODO
+            # 直接保存音频到指定路径中
+            if os.path.isfile(output_path):
+                os.remove(output_path)
+                print(">> remove old wav file:", output_path)
+            if os.path.dirname(output_path) != "":
+                os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            torchaudio.save(output_path, wav.type(torch.int16), sampling_rate)  # 保存为16位PCM
+            print(">> wav file saved to:", output_path)
+            if stream_return:
+                return None
+            yield output_path
+
+
+
+
     def state_dict(self, *args, destination=None, prefix="", keep_vars=False):
         """
         保存：只返回需要训练的参数
@@ -91,6 +162,7 @@ class UniTextAudioFaceModel(nn.Module):
         device,
     ):
         '''
+        训练模式专用
         这里实例化IndexTTS2中核心的GPT模型并加载权重
         '''
         from indextts.gpt.model_v2 import UnifiedVoice
@@ -144,6 +216,24 @@ class UniTextAudioFaceModel(nn.Module):
 
 
         return model.to(device)
+
+    def build_inference_indextts2_model(self):
+        '''
+        如果有自己微调gpt权重，则替换配置文件中的权重路径
+        '''
+        from unitaf_train_component.indextts2_inference_component import UniTAFIndexTTS2
+        indextts2_cfg = OmegaConf.load("checkpoints/config.yaml")  # 加载IndexTTS2配置
+        gpt_ckpt = self.cfg.get("finetune_checkpoint", {}).get("tts_model")
+        if gpt_ckpt is not None:
+            indextts2_cfg.gpt_checkpoint = gpt_ckpt  # 用自己微调的权重替代预训练gpt权重
+
+        tts_model = UniTAFIndexTTS2(
+            cfg=indextts2_cfg,
+            model_dir="checkpoints",
+            use_cuda_kernel=False,  # 禁用CUDA内核
+            use_torch_compile=True  # 启用torch.compile优化
+        )
+        return tts_model
 
     def build_indextts2_s2mel(
         self,
@@ -200,13 +290,18 @@ class UniTextAudioFaceModel(nn.Module):
         """
         from unitaf_train_component.audio_feature_projector import AudioFeatureProjector
         proj = AudioFeatureProjector(in_dim, out_dim)
-        # TODO:如果有配置文件中权重，则加载该权重
-        # 随机初始化AudioFeatureProjector
-        with torch.no_grad():
-            # 卷积权重用 Kaiming 正态
-            nn.init.kaiming_normal_(proj.conv.weight, mode='fan_out', nonlinearity='relu')
-            # 偏置置零
-            nn.init.zeros_(proj.conv.bias)
+
+        ckpt_path = self.cfg.get("finetune_checkpoint", {}).get("audio_feature_projector")
+        if ckpt_path: # 如果存在权重
+            state_dict = torch.load(ckpt_path, map_location='cpu')
+            proj.load_state_dict(state_dict)
+        else:
+            # 随机初始化AudioFeatureProjector
+            with torch.no_grad():
+                # 卷积权重用 Kaiming 正态
+                nn.init.kaiming_normal_(proj.conv.weight, mode='fan_out', nonlinearity='relu')
+                # 偏置置零
+                nn.init.zeros_(proj.conv.bias)
         return AudioFeatureProjector(in_dim, out_dim)
 
 
@@ -263,11 +358,19 @@ if __name__ == '__main__':
             "dataset_root_path": "/home/zqg/project/data/UniTAF Dataset",
             "dataset_list": ["D12"]  # 这里测试也传数据集是用于指导模型选择何种输出头
         },
+        # 仅在推理模式下指定的部分模块的微调权重
+        "finetune_checkpoint": {
+            "tts_model": "./unitaf_ckpt/XXX/tts_model.bin",
+            "audio_feature_projector": "./unitaf_ckpt/XXX/audio_feature_projector.bin",
+            "a2f_model": "./unitaf_ckpt/XXX/a2f_model.bin",
+        }
     }
 
     cfg = OmegaConf.create(train_config)
 
-    unitaf = UniTextAudioFaceModel(cfg, device=torch.device("cuda:0"), mode="train")
+    # unitaf = UniTextAudioFaceModel(cfg, device=torch.device("cuda:0"), mode="train")  # 训练模式
+    unitaf = UniTextAudioFaceModel(cfg, device=torch.device("cuda:0"), mode="inference")  # 推理模式
+
 
     # 1. 打印模型结构
     print("=" * 80)
