@@ -59,6 +59,8 @@ from transformers import TrainingArguments
 from transformers.trainer_pt_utils import get_parameter_names
 import wandb
 
+from peft import LoraConfig, get_peft_model, PeftModel
+
 # UniTextAudioFace的dataset
 from unitaf_dataset import UniTAFDataset
 # 组装联合模型UniTextAudioFace的类
@@ -231,13 +233,24 @@ class UniTAFTrainer(Trainer):
             text_emb = self.model.tts_model.text_embedding(text_inputs) + self.model.tts_model.text_pos_embedding(text_inputs)
             mel_emb = self.model.tts_model.mel_embedding(mel_inputs) + self.model.tts_model.mel_pos_embedding(mel_inputs)
 
+            if self.train_config["train_tts_lora"]:
+                '''
+                如果是LoRA微调的话，base_model均不会开梯度，只会给LoRA矩阵开梯度。
+                但是为了保证正常训练，还需要额外给text_emb/mel_emb开梯度，这样才能够顺利反向传播
+                '''
+                text_emb = text_emb.requires_grad_(True)
+                mel_emb = mel_emb.requires_grad_(True)
+            # print('[DEBUG] text_emb.requires_grad:', text_emb.requires_grad,
+            #       'mel_emb.requires_grad:', mel_emb.requires_grad)
+
             # (2) IndexTTS中gpt模型的前向过程
             text_logits, mel_logits, text_latent, mel_latent = self.model.tts_model.get_logits(
                 conds, text_emb, self.model.tts_model.text_head, mel_emb, self.model.tts_model.mel_head,
                 return_both=True  # 我们于indextts.gpt.model_v2.UnifiedVoice.get_logits()新增该return_both分支，
                 # 用于同时返回tts训练用的logits和gt_audio的latent。logits用于计算tts loss，latent用于得到后续audio feature
             )  # 这里返回的mel_latent就是GT对应的latent
-
+            # print('[DEBUG] mel_logits.requires_grad:', mel_logits.requires_grad,
+            #       'mel_latent.requires_grad:', mel_latent.requires_grad)
 
             # (3) 根据gpt前向得到的logits计算loss
             text_mask = (
@@ -280,30 +293,8 @@ class UniTAFTrainer(Trainer):
 
             # 这里 s2mel 不参与更新，在optimizer中排除，但这里不适用with torch.no_grad():以避免中断计算图
             mel_latent = self.model.s2mel.models["gpt_layer"](mel_latent)  # torch.Size([B, L, 1024])
-
             # print("[compute loss] mel_latent after gpt_layer", mel_latent.shape)  # torch.Size([16, 479, 1024])
-
-                # # TODO: 这里会不会有没有剔除干净的只有训练时才会添加的pad残留？
-                # # TODO: 这里是否应该传入audio_codes？
-                # S_infer = self.semantic_codec.quantizer.vq2emb(audio_codes.unsqueeze(1))  # 编码转嵌入 torch.Size([B, 1024, L])
-                # S_infer = S_infer.transpose(1, 2)  # torch.Size([1, L, 1024])
-                # S_infer = S_infer + mel_latent  # 融合潜在表示 torch.Size([1, L, 1024])
-                # target_lengths = (mel_latent.shape[1] * 1.72).long()  # 计算目标长度  L*1.72
-                #
-                # # 长度调节
-                # cond = self.s2mel.models['length_regulator'](S_infer,
-                #                                              ylens=target_lengths,
-                #                                              n_quantizers=3,
-                #                                              f0=None)[0]
-                # cat_condition = torch.cat([prompt_condition, cond], dim=1)  # 拼接条件  # [1, 670, 512]
-                # # 条件流匹配推理
-                # vc_target = self.s2mel.models['cfm'].inference(cat_condition,
-                #                                                torch.LongTensor([cat_condition.size(1)]).to(
-                #                                                    cond.device),
-                #                                                ref_mel, style, None, diffusion_steps=25,
-                #                                                inference_cfg_rate=0.7)
-                # # print(f"vc_target: {vc_target.shape}")  # [1, 80, 670]
-                # vc_target = vc_target[:, :, ref_mel.size(-1):]  # 裁剪目标梅尔谱图
+            # print('[DEBUG] after s2mel mel_latent.requires_grad:', mel_latent.requires_grad)
 
         # 2. 获得TTS部分核心输出 处理audio feature
         if "IndexTTS2" in self.train_config["tts_model"] and "UniTalker" in self.train_config["a2f_model"]:
@@ -331,7 +322,7 @@ class UniTAFTrainer(Trainer):
             audio_feature = self.model.audio_feature_projector(audio_feature)
             # print("[compute loss] audio_feature.shape", audio_feature.shape)  # torch.Size([16, 240, 1024])
 
-            # print("audio_feature.requires_grad:", audio_feature.requires_grad)  # True
+            # print("[DEBUG] audio_feature.requires_grad:", audio_feature.requires_grad)  # True
             # print('audio_feature.grad_fn:', audio_feature.grad_fn)  # 且存在grad_fn
 
             # print('audio_feature  mean/absmean/max :',
@@ -463,8 +454,6 @@ class UniTAFTrainer(Trainer):
         '''
         训练tts且使用LoRA训练时，返回peft model
         '''
-        from peft import LoraConfig, get_peft_model
-
         assert self.train_config["train_tts"] == True and self.train_config["train_tts_lora"] == True
         # 只给 TTS 模型加 LoRA
         lora_config = LoraConfig(
@@ -477,6 +466,7 @@ class UniTAFTrainer(Trainer):
         )
 
         model.tts_model = get_peft_model(model.tts_model, lora_config)
+        print("[apply_lora_to_tts] TTS LoRA可训练参数量：")
         model.tts_model.print_trainable_parameters()  # 打印 LoRA 参数量
         return model
 
@@ -492,7 +482,13 @@ class UniTAFTrainer(Trainer):
             if self.train_config["train_tts_lora"]:
                 # TTS-LoRA部分需要训练
                 for name, param in model.tts_model.named_parameters():
-                    param.requires_grad = ("lora_" in name)
+                    if "lora_A" in name or "lora_B" in name:
+                        param.requires_grad = True
+                # # 打印确认
+                # print("[set_model_training_mode] LoRA 可训练参数:")
+                # for name, p in model.tts_model.named_parameters():
+                #     if p.requires_grad:
+                #         print("  ", name)
             else:
                 # TTS部分需要训练
                 for param in model.tts_model.parameters():
@@ -630,10 +626,6 @@ class UniTAFTrainer(Trainer):
                             self.train_config["UniTalker"]["pca_weight"] * loss_dict["a2f_pca_loss"])
         total_loss = tts_loss + a2f_loss
 
-        print('[DEBUG] tts_text_loss.requires_grad:', loss_dict["tts_text_loss"].requires_grad)
-        print('[DEBUG] tts_mel_loss.requires_grad :', loss_dict["tts_mel_loss"].requires_grad)
-        print('[DEBUG] tts_loss.requires_grad     :', tts_loss.requires_grad, tts_loss.grad_fn)
-
         # # 清除之前的梯度
         # model.zero_grad(set_to_none=True)
 
@@ -651,12 +643,14 @@ class UniTAFTrainer(Trainer):
             #             if param.requires_grad:
             #                 a2f_grad_states[name] = param.grad
 
-            # 打印 TTS 梯度 ---------------------------------------------------
-            print("[training_step] TTS grad sample:")
-            for name, p in model.tts_model.named_parameters():
-                if p.grad is not None:
-                    print("✅", name[:60], p.grad.norm().item())
-            # ----------------------------------------------------------------
+            # # 打印 TTS 梯度 ---------------------------------------------------
+            # print("[training_step] TTS grad sample:")
+            # for name, p in model.tts_model.named_parameters():
+            #     if p.grad is not None:
+            #         print("✅", name[:60], p.grad.norm().item())
+            #     else:
+            #         print("❌", name[:60], "grad=None")
+            # # ----------------------------------------------------------------
 
             # tts反向传播
             if use_amp:
@@ -665,12 +659,12 @@ class UniTAFTrainer(Trainer):
             else:
                 tts_loss.backward(retain_graph=True)  # 保留梯度给 A2F 用
 
-            # 恢复A2F梯度状态
-            if self.train_config["train_a2f"] and a2f_loss.item() != 0:
-                with torch.no_grad():
-                    for name, param in self.model.a2f_model.named_parameters():
-                        if param.requires_grad and name in a2f_grad_states:
-                            param.grad = a2f_grad_states[name]
+            # # 恢复A2F梯度状态
+            # if self.train_config["train_a2f"] and a2f_loss.item() != 0:
+            #     with torch.no_grad():
+            #         for name, param in self.model.a2f_model.named_parameters():
+            #             if param.requires_grad and name in a2f_grad_states:
+            #                 param.grad = a2f_grad_states[name]
 
             # # 打印 TTS 梯度 ---------------------------------------------------
             # print("[training_step] TTS grad sample:")
@@ -951,7 +945,7 @@ if __name__ == '__main__':
     python unitaf_train/train_unitaf.py 
     '''
     # 设置使得Trainer限制在固定卡上
-    os.environ["CUDA_VISIBLE_DEVICES"] = "4"  # 只用第 1 号卡，此时会从可见卡开始编码cuda:0,cuda:1...
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # 只用第 0 号卡，此时会从可见卡开始编码cuda:0,cuda:1...
 
     train_config = {
         # 模型类型，这里用于指导训练器类训练哪些模型
@@ -1000,16 +994,16 @@ if __name__ == '__main__':
         "warmup_steps": 0, # 所有调度器统一参数 warmup 为50
         "log_interval": 20,  # training_step 里打印 loss 的步长
         "val_interval": 500,  # 每隔多少 step 做一次验证
-        "save_interval": 2,  # 每隔多少 step 存一次 ckpt
+        "save_interval": 20000,  # 每隔多少 step 存一次 ckpt
         "output_dir": "./unitaf_ckpt",  # 断点 & 日志保存根目录
         "resume_path": None,  # 如需断点续训，填 ckpt 路径或 True
         # 分别训练tts和a2f的配置
         "train_tts": True,
         "train_tts_lora": True,
-        "train_a2f": False,  # 只要训练a2f,则必须训练audio feature projector. 故不在额外增加投影层是否训练的参数判断了
+        "train_a2f": True,  # 只要训练a2f,则必须训练audio feature projector. 故不在额外增加投影层是否训练的参数判断了
         # 优化器设置，为不同模块设置不同优化器
         "tts_train_cfg": {
-            "lr": 2e-4,
+            "lr": 1e-5,
             "betas": (0.9, 0.999),
             "weight_decay": 0.01,
             "eps": 1e-08,
