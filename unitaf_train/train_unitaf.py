@@ -17,6 +17,7 @@ UniTAFTrainer继承使用transformers Trainer类。
 '''
 import sys
 import os
+import copy
 
 # 添加项目根目录到Python路径
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -626,9 +627,6 @@ class UniTAFTrainer(Trainer):
                             self.train_config["UniTalker"]["pca_weight"] * loss_dict["a2f_pca_loss"])
         total_loss = tts_loss + a2f_loss
 
-        # # 清除之前的梯度
-        # model.zero_grad(set_to_none=True)
-
         # 3. 各自反向
         use_amp = self.train_config["use_amp"] and torch.cuda.is_available()
 
@@ -642,15 +640,6 @@ class UniTAFTrainer(Trainer):
             #         for name, param in self.model.a2f_model.named_parameters():
             #             if param.requires_grad:
             #                 a2f_grad_states[name] = param.grad
-
-            # # 打印 TTS 梯度 ---------------------------------------------------
-            # print("[training_step] TTS grad sample:")
-            # for name, p in model.tts_model.named_parameters():
-            #     if p.grad is not None:
-            #         print("✅", name[:60], p.grad.norm().item())
-            #     else:
-            #         print("❌", name[:60], "grad=None")
-            # # ----------------------------------------------------------------
 
             # tts反向传播
             if use_amp:
@@ -702,6 +691,18 @@ class UniTAFTrainer(Trainer):
             #     elif g_norm < 1e-6:
             #         tiny += 1
             # print(f"A2F 总参数 {total} | 零梯度 {zero} | 极小梯度 {tiny}")  # A2F 总参数 19 | 零梯度 0 | 极小梯度 0
+
+        # 日志记录tts和a2f各模块的梯度
+        if (self.state.global_step + 1) % self.args.logging_steps == 0:
+            log_dict={}
+            with torch.no_grad():
+                tts_norm = torch.norm(torch.stack(
+                    [p.grad.norm() for p in self.model.tts_model.parameters() if p.grad is not None]))
+                a2f_norm = torch.norm(torch.stack(
+                    [p.grad.norm() for p in self.model.a2f_model.parameters() if p.grad is not None]))
+            log_dict["grad_norm/tts"] = tts_norm.item()
+            log_dict["grad_norm/a2f"] = a2f_norm.item()
+            self.log(log_dict)
 
 
         # 4. 梯度裁剪
@@ -841,24 +842,30 @@ class UniTAFTrainer(Trainer):
 
         # 1. TTS 权重
         if hasattr(model, 'tts_model') and any(p.requires_grad for p in model.tts_model.parameters()):
-            tts_path = os.path.join(output_dir, "tts_model.bin")
+            print("[UniTAFTrainer._save_checkpoint] 准备保存tts")
+            tts_path = os.path.join(output_dir, "tts_model.pt")
             # 如果是LoRA训练
             if hasattr(model.tts_model, 'merge_and_unload'):   # PeftModel 的标志
-                merged = model.tts_model.merge_and_unload()    # 合并后的 base_model
-                torch.save(merged.state_dict(), tts_path)
-                del merged                                     # 释放显存
+                # print("尝试保存合并后的LoRA tts")
+                with torch.no_grad():  # 这里创建拷贝来合并模型，而非在原有模型上合并，以防止合并后优化器指向错误模型。
+                    merge_copy = copy.deepcopy(model.tts_model)
+                    merged_base = merge_copy.merge_and_unload()
+                    torch.save(merged_base.state_dict(), tts_path)
+                    del merge_copy, merged_base                       # 释放显存
             else:
                 torch.save(model.tts_model.state_dict(), tts_path)
 
         # 2. A2F 权重（不含 loss_module）
         if hasattr(model, 'a2f_model') and any(p.requires_grad for p in model.a2f_model.parameters()):
+            # print("[UniTAFTrainer._save_checkpoint] 准备保存a2f")
             a2f_sd = {k: v for k, v in model.a2f_model.state_dict().items() if 'loss_module' not in k}
-            torch.save(a2f_sd, os.path.join(output_dir, "a2f_model.bin"))
+            torch.save(a2f_sd, os.path.join(output_dir, "a2f_model.pt"))
 
         # 3. 投影层
         if hasattr(model, 'audio_feature_projector') and any(p.requires_grad for p in model.audio_feature_projector.parameters()):
+            # print("[UniTAFTrainer._save_checkpoint] 准备保存projector")
             torch.save(model.audio_feature_projector.state_dict(),
-                       os.path.join(output_dir, "audio_feature_projector.bin"))
+                       os.path.join(output_dir, "audio_feature_projector.pt"))
 
         # 4. 让父类继续保存 optimizer / scheduler / args 等
         # 根据签名决定怎么调父类
@@ -915,7 +922,7 @@ def main(train_config):
 
     # 2. 实例化基础联合模型（Trainer 需要）
     device = torch.device(train_config["device"] if torch.cuda.is_available() else "cpu")
-    model = UniTextAudioFaceModel(cfg=train_config, device=device)
+    model = UniTextAudioFaceModel(cfg=train_config, device=device, mode="train")
 
     # 初始化Trainer
     trainer = UniTAFTrainer(
@@ -987,14 +994,14 @@ if __name__ == '__main__':
         "device": "cuda:0",  # 注: 需要与外部的CUDA_VISIBLE_DEVICES一致!但只有一个可见卡时，硬编码则应该是cuda：0
         # 训练设置-------------------------------------------------------------------------------------------------------
         "batch_size": 2,
-        "epochs": 20,
+        "epochs": 8,
         "grad_accumulation": 1,
         "grad_clip": 1.0,
         "use_amp": True,
-        "warmup_steps": 0, # 所有调度器统一参数 warmup 为50
-        "log_interval": 20,  # training_step 里打印 loss 的步长
-        "val_interval": 500,  # 每隔多少 step 做一次验证
-        "save_interval": 20000,  # 每隔多少 step 存一次 ckpt
+        "warmup_steps": 50, # 所有调度器统一参数 warmup 为50
+        "log_interval": 20,  # training_step 里打印 loss 的步长         # 20
+        "val_interval": 1000,  # 每隔多少 step 做一次验证               # 1000
+        "save_interval": 20000,  # 每隔多少 step 存一次 ckpt              # 20000
         "output_dir": "./unitaf_ckpt",  # 断点 & 日志保存根目录
         "resume_path": None,  # 如需断点续训，填 ckpt 路径或 True
         # 分别训练tts和a2f的配置
