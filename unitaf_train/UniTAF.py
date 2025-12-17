@@ -7,16 +7,22 @@
 需要注意的是，在训练过程中，这里tts_model一般仅为TTS中自回归transformer部分！
 其余的TTS音频编码器/解码器都放在Dataset类中以推理模式进行数据预处理。
 
+在推理过程中，tts_model一般为原本完整的tts模型
+
 '''
 from omegaconf import OmegaConf
 import sys
 import os
+import numpy as np
 from pathlib import Path
 from omegaconf import OmegaConf
 from typing import Dict, List, Optional, Sequence, Set, Tuple, Any
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from torchgen.native_function_generation import self_to_out_signature
+
 
 class UniTextAudioFaceModel(nn.Module):
     def __init__(
@@ -85,24 +91,64 @@ class UniTextAudioFaceModel(nn.Module):
                     device=device,
                 )
                 self.a2f_model.eval()
+                # 加载loss_modeule
+                from a2f.loss.loss import UniTalkerLoss
+                self.a2f_loss_module = UniTalkerLoss(OmegaConf.load("a2f/config/unitalker.yaml")["LOSS"]).cuda()
                 # 如果同时存在UniTalker和IndexTTS2,则初始化中间特征的投影层
                 if "IndexTTS2" in cfg["tts_model"]:
                     self.audio_feature_projector = self.build_audio_feature_projector(in_dim=1024, out_dim=1024)
                     self.audio_feature_projector.eval()
 
     # TODO
-    def indextts2_unitalker_inference(self, spk_audio_prompt, text, output_path,
-              emo_audio_prompt=None, emo_alpha=1.0,
-              emo_vector=None,
-              use_emo_text=False, emo_text=None, use_random=False, interval_silence=200,
-              verbose=False, max_text_tokens_per_segment=120, stream_return=False, more_segment_before=0, **generation_kwargs):
+    def indextts2_unitalker_inference(
+        self,
+        # TTS部分（IndexTTS2）所需参数
+        spk_audio_prompt,
+        text,
+        output_path,
+        emo_audio_prompt=None,
+        emo_alpha=1.0,
+        emo_vector=None,
+        use_emo_text=False,
+        emo_text=None,
+        use_random=False,
+        interval_silence=200,
+        verbose=False,
+        max_text_tokens_per_segment=120,
+        stream_return=False,
+        more_segment_before=0,
+        **generation_kwargs
+    ):
         '''
         UniTAF联合模型的推理流程，接收所有原始IndexTTS2的参数
+        (默认IndexTTS2以24k HZ采样率，UniTalker Decoder设置为25fps)
+
+        Args：
+        以下为控制TTS生成的参数
+            spk_audio_prompt： reference audio 语音克隆参考音频
+            text： 目标文本，生成根据这个文本对应的语音
+            output_path： 生成的音频和表情保存的路径
+            emo_audio_prompt： 传入用于控制情感的提示音频（如果没有则一般从spk_audio_prompt中获得）
+            emo_alpha： 情感控制作用系数，使用文本情感模式时使用大约 0.6（或更低）的 emo_alpha
+            emo_vector： 直接指定具体的情感向量，传入时以该emo_vector为准
+            use_emo_text： 是否从文本中推断情感，如果是优先从emo_text中推断情感，否则从目标文本中推断情感。
+            emo_text： 当use_emo_text时，如果传入emo_text，根据从emo_text中推断出的情感来控制生成
+            use_random： 随机情感控制
+            interval_silence： 静音间隔，一般保持默认即可，在流式生成中，多个片段拼接时会插入静音间隔来保证声音自然
+            verbose： 是否打印中间结果
+            max_text_tokens_per_segment： 流式生成对输入进行切分时，每个分段的最大切分token数
+            stream_return： 是否流式返回
+            more_segment_before：默认为0 暂时不知道是什么意思
+
+            **generation_kwargs： IndexTTS2.infer_generator中接收的其他参数，暂时不详
         '''
+        import torchaudio
+
         # 必须是IndexTTS2与UniTalker Decoder的联合模型的推理模式
         assert "IndexTTS2" in self.cfg["tts_model"] and "UniTalker" in self.cfg["a2f_model"]
         assert self.mode == "inference"
 
+        # 1. tts生成
         tts_gen = self.tts_model.infer(spk_audio_prompt, text,
               emo_audio_prompt, emo_alpha,
               emo_vector,
@@ -113,25 +159,49 @@ class UniTextAudioFaceModel(nn.Module):
         for sr, wav_data, audio_feature in tts_gen:  # 循环会一次性跑完，循环变量留下最后一次的值
             pass
 
-        print(sr)  # 22050
-        print(wav_data.shape)  # (N, 1)  int16
-        print(audio_feature.shape)  # (1, T, 1024)
-
-
-        if output_path: # TODO
+        # 保存音频
+        if output_path:
             # 直接保存音频到指定路径中
             if os.path.isfile(output_path):
                 os.remove(output_path)
                 print(">> remove old wav file:", output_path)
             if os.path.dirname(output_path) != "":
                 os.makedirs(os.path.dirname(output_path), exist_ok=True)
-            torchaudio.save(output_path, wav.type(torch.int16), sampling_rate)  # 保存为16位PCM
+            torchaudio.save(output_path, wav_data.type(torch.int16), sr)  # 保存为16位PCM
             print(">> wav file saved to:", output_path)
-            if stream_return:
-                return None
-            yield output_path
 
+        # 2. projector
+        audio_feature = F.pad(audio_feature, (0, 0, 0, 1), mode='constant', value=0)  # (B, L+1, 1024)
+        audio_feature = self.model.audio_feature_projector(audio_feature)
 
+        # 2. a2f生成
+        '''
+        face_template: 用于表示说话人静态的脸形，因此是一个与标注格式的表示形状FLAME相同的初始偏移量
+            但是在arkit中我们不需要这个，故而保持和我们标注格式相同维度的0向量即可
+        identy: 在训练时，网络为每一个训练对象（identity）学了一个可学习的风格嵌入。decoder.learnable_style_emb.weight[i]，i 就是 style_idx。
+            推理时，模型拿到这个索引后，把对应的那一列风格向量抽出来，再去调制音频-动作映射，于是同一段音频在不同身份下会生成不同的口型/表情风格。
+            我们这里传最后一个身份索引 args.identity_num-1 来表示"通用/平均"的风格。
+        '''
+        # TODO: annot_type由外部传入，而不在此处写死，同时template随之变化
+        B, T, _ = audio_feature.shape
+        face_template = torch.zeros(B, 61, device=audio_feature.device)  # 与"qxsk_inhouse_blendshape_weight"标注格式相同
+        identity = torch.full((B,),self.model.a2f_model.model_cfg["identity_num"] - 1,
+                              dtype=torch.long, device=audio_feature.device)
+
+        out_motion, _, _ = self.model.a2f_model(
+            audio_feature=audio_feature,
+            template=face_template,
+            face_motion=None,
+            style_idx=identity,
+            annot_type="qxsk_inhouse_blendshape_weight",
+            fps=25
+        )
+
+        out = self.a2f_loss_module.get_vertices(torch.from_numpy(out_motion).cuda(), annot_type="qxsk_inhouse_blendshape_weight")
+        if output_path:
+            # 保存结果为npz文件
+            print(f"save results to {output_path}")
+            np.savez(output_path, out)
 
 
     def state_dict(self, *args, destination=None, prefix="", keep_vars=False):
@@ -318,6 +388,9 @@ if __name__ == '__main__':
     """
     测试联合模型的流程 python unitaf_train/UniTAF.py
     """
+    # 将测试限制在固定卡上
+    os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+
     # 添加项目根目录到Python路径
     current_dir = os.path.dirname(os.path.abspath(__file__))
     project_root = os.path.dirname(current_dir)  # unitaf_train的父目录
@@ -360,9 +433,9 @@ if __name__ == '__main__':
         },
         # 仅在推理模式下指定的部分模块的微调权重
         "finetune_checkpoint": {
-            "tts_model": "./unitaf_ckpt/XXX/tts_model.bin",
-            "audio_feature_projector": "./unitaf_ckpt/XXX/audio_feature_projector.bin",
-            "a2f_model": "./unitaf_ckpt/XXX/a2f_model.bin",
+            "tts_model": "./unitaf_ckpt/checkpoint-20000/tts_model.bin",
+            "audio_feature_projector": "./unitaf_ckpt/checkpoint-20000/audio_feature_projector.bin",
+            "a2f_model": "./unitaf_ckpt/checkpoint-20000/a2f_model.bin",
         }
     }
 

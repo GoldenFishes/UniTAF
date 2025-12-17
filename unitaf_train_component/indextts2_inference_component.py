@@ -679,7 +679,18 @@ class UniTAFIndexTTS2(IndexTTS2):
         yield (sampling_rate, wav_data, audio_feature)
 
 
+def find_most_similar_cosine(query_vector, matrix):
+    """
+    使用余弦相似度在矩阵中查找与查询向量最相似的向量
+    """
+    query_vector = query_vector.float()  # 确保为float类型
+    matrix = matrix.float()  # 确保为float类型
 
+    # 计算余弦相似度 [num_vectors]
+    similarities = F.cosine_similarity(query_vector, matrix, dim=1)
+    # 找到相似度最高的索引
+    most_similar_index = torch.argmax(similarities)
+    return most_similar_index
 
 
 
