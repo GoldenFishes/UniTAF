@@ -129,7 +129,8 @@ class UniTalkerDecoder(BaseModel):
         '''
         # print("[UniTalker Decoder] audio_feature shape:", audio_feature.shape)  # torch.Size([16, 240, 1024])
         # print("[UniTalker Decoder] face_motion shape:", face_motion.shape)  # torch.Size([16, 240, 61])
-        face_motion = face_motion.unsqueeze(1)
+        if face_motion is not None:
+            face_motion = face_motion.unsqueeze(1)
 
         # 计算帧数
         if face_motion is not None:

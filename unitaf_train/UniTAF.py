@@ -91,21 +91,39 @@ class UniTextAudioFaceModel(nn.Module):
                     device=device,
                 )
                 self.a2f_model.eval()
+
+                # ----对UniTalker进行包修复----
+                # UniTalker loss计算所需的包 chumpy 最后一次更新停留在 2018 年，内部用了 Python 3 已废弃的 inspect.getargspec，在 Python≥3.11 会报：
+                # AttributeError: module 'inspect' has no attribute 'getargspec'
+                import inspect
+                inspect.getargspec = inspect.getfullargspec  # 这里临时补丁修复，否则会影响UniTalker Loss计算
+                # 防止 chumpy 用旧的用法时尝试报错
+                import numpy as np
+                # 重建被删的别名
+                np.bool = bool
+                np.int = int
+                np.float = float
+                np.complex = complex
+                np.object = object
+                np.str = str
+                np.unicode = str
+                # -------------------------
+
                 # 加载loss_modeule
                 from a2f.loss.loss import UniTalkerLoss
                 self.a2f_loss_module = UniTalkerLoss(OmegaConf.load("a2f/config/unitalker.yaml")["LOSS"]).cuda()
                 # 如果同时存在UniTalker和IndexTTS2,则初始化中间特征的投影层
                 if "IndexTTS2" in cfg["tts_model"]:
                     self.audio_feature_projector = self.build_audio_feature_projector(in_dim=1024, out_dim=1024)
-                    self.audio_feature_projector.eval()
+                    self.audio_feature_projector.eval().cuda()
 
-    # TODO
     def indextts2_unitalker_inference(
         self,
         # TTS部分（IndexTTS2）所需参数
         spk_audio_prompt,
         text,
-        output_path,
+        output_dir,
+        save_name="output",
         emo_audio_prompt=None,
         emo_alpha=1.0,
         emo_vector=None,
@@ -117,7 +135,8 @@ class UniTextAudioFaceModel(nn.Module):
         max_text_tokens_per_segment=120,
         stream_return=False,
         more_segment_before=0,
-        **generation_kwargs
+        # a2f部分所需参数
+        render=False
     ):
         '''
         UniTAF联合模型的推理流程，接收所有原始IndexTTS2的参数
@@ -127,7 +146,8 @@ class UniTextAudioFaceModel(nn.Module):
         以下为控制TTS生成的参数
             spk_audio_prompt： reference audio 语音克隆参考音频
             text： 目标文本，生成根据这个文本对应的语音
-            output_path： 生成的音频和表情保存的路径
+            output_dir： 生成的音频和表情保存的路径
+            save_name： 保存的音频和表情的文件名
             emo_audio_prompt： 传入用于控制情感的提示音频（如果没有则一般从spk_audio_prompt中获得）
             emo_alpha： 情感控制作用系数，使用文本情感模式时使用大约 0.6（或更低）的 emo_alpha
             emo_vector： 直接指定具体的情感向量，传入时以该emo_vector为准
@@ -140,6 +160,8 @@ class UniTextAudioFaceModel(nn.Module):
             stream_return： 是否流式返回
             more_segment_before：默认为0 暂时不知道是什么意思
 
+        以下是控制A2F部分的参数
+            rander：是否进行渲染
             **generation_kwargs： IndexTTS2.infer_generator中接收的其他参数，暂时不详
         '''
         import torchaudio
@@ -153,26 +175,34 @@ class UniTextAudioFaceModel(nn.Module):
               emo_audio_prompt, emo_alpha,
               emo_vector,
               use_emo_text, emo_text, use_random, interval_silence,
-              verbose, max_text_tokens_per_segment, stream_return, more_segment_before, **generation_kwargs)
+              verbose, max_text_tokens_per_segment, stream_return, more_segment_before)
 
+        print("获得结果")
         # 取最后一次 yield 的值
-        for sr, wav_data, audio_feature in tts_gen:  # 循环会一次性跑完，循环变量留下最后一次的值
-            pass
+        if stream_return:
+            # 流式模式：tts_result 是生成器
+            for sr, wav, audio_feature in tts_gen:
+                pass  # 循环会获取最后一个值
+        else:
+            # 非流式模式：tts_result 已经是 (sr, wav_data, audio_feature) 元组
+            sr, wav, audio_feature = tts_gen
 
         # 保存音频
-        if output_path:
+        if output_dir:
+            wav_path = Path(output_dir) / f"{save_name}.wav"
             # 直接保存音频到指定路径中
-            if os.path.isfile(output_path):
-                os.remove(output_path)
-                print(">> remove old wav file:", output_path)
-            if os.path.dirname(output_path) != "":
-                os.makedirs(os.path.dirname(output_path), exist_ok=True)
-            torchaudio.save(output_path, wav_data.type(torch.int16), sr)  # 保存为16位PCM
-            print(">> wav file saved to:", output_path)
+            if os.path.isfile(wav_path):
+                os.remove(wav_path)
+                print(">> remove old wav file:", wav_path)
+            if os.path.dirname(wav_path) != "":
+                os.makedirs(os.path.dirname(wav_path), exist_ok=True)
+
+            torchaudio.save(wav_path, wav, sr)  # 保存为16位PCM
+            print(">> wav file saved to:", wav_path)
 
         # 2. projector
         audio_feature = F.pad(audio_feature, (0, 0, 0, 1), mode='constant', value=0)  # (B, L+1, 1024)
-        audio_feature = self.model.audio_feature_projector(audio_feature)
+        audio_feature = self.audio_feature_projector(audio_feature)
 
         # 2. a2f生成
         '''
@@ -185,10 +215,10 @@ class UniTextAudioFaceModel(nn.Module):
         # TODO: annot_type由外部传入，而不在此处写死，同时template随之变化
         B, T, _ = audio_feature.shape
         face_template = torch.zeros(B, 61, device=audio_feature.device)  # 与"qxsk_inhouse_blendshape_weight"标注格式相同
-        identity = torch.full((B,),self.model.a2f_model.model_cfg["identity_num"] - 1,
+        identity = torch.full((B,),self.a2f_model.model_cfg["identity_num"] - 1,
                               dtype=torch.long, device=audio_feature.device)
 
-        out_motion, _, _ = self.model.a2f_model(
+        out_motion, _, _ = self.a2f_model(
             audio_feature=audio_feature,
             template=face_template,
             face_motion=None,
@@ -197,11 +227,48 @@ class UniTextAudioFaceModel(nn.Module):
             fps=25
         )
 
-        out = self.a2f_loss_module.get_vertices(torch.from_numpy(out_motion).cuda(), annot_type="qxsk_inhouse_blendshape_weight")
-        if output_path:
+        # 处理 out_motion，确保它是 Tensor 并且在正确的设备上
+        print(f"out_motion 类型: {type(out_motion)}")
+        print(f"out_motion 设备: {getattr(out_motion, 'device', 'N/A')}")
+
+        # 获取到顶点数据
+        out = self.a2f_loss_module.get_vertices(out_motion.cuda(), annot_type="qxsk_inhouse_blendshape_weight")
+
+        if isinstance(out, torch.Tensor):
+            # 如果 out 是 CUDA tensor，先移到 CPU
+            if out.is_cuda:
+                # print("将 out 从 CUDA 移到 CPU")
+                out_cpu = out.cpu()
+            else:
+                out_cpu = out
+            out_np = out_cpu.detach().numpy()  # 分离计算图并转换为 numpy
+        else:
+            out_np = out  # 如果已经是 numpy 或其他类型
+
+        if output_dir:
+            face_path = Path(output_dir) / f"{save_name}.npz"
+            if os.path.isfile(face_path):
+                os.remove(face_path)
+                print(">> remove old wav file:", face_path)
+            if os.path.dirname(face_path) != "":
+                os.makedirs(os.path.dirname(face_path), exist_ok=True)
             # 保存结果为npz文件
-            print(f"save results to {output_path}")
-            np.savez(output_path, out)
+            np.savez(face_path, out_np)
+            print(f">> face results save to {face_path}")
+
+        if render:
+            # print("目前不支持直接渲染，因为UniTAF运行环境为pytorch2.8.0+cu128，而渲染所需的依赖为pytorch3d（最高仅支持到怕pytorch2.4）")
+            # pass
+            from unitaf_train_component.render import render_npz_video
+            # 进行渲染
+            render_npz_video(
+                out_np=out_np,
+                audio_path=wav_path,  # 原始 wav 完整路径；None=无声
+                out_dir=output_dir,  # 想把视频/图片保存文件夹
+                annot_type="qxsk_inhouse_blendshape_weight",  # 你当时传给 get_vertices 的同一字符串
+                save_images=False,  # False=直接出 mp4；True=出逐帧 png
+                device="cuda"  # 或 "cpu"
+            )
 
 
     def state_dict(self, *args, destination=None, prefix="", keep_vars=False):
@@ -224,13 +291,7 @@ class UniTextAudioFaceModel(nn.Module):
         return sd
 
     # 工具方法 --------------------------------------------------------------------------------------
-    def build_indextts2_model(
-        self,
-        cfg,
-        tokenizer,
-        base_checkpoint,
-        device,
-    ):
+    def build_indextts2_model(self, cfg, tokenizer, base_checkpoint, device):
         '''
         训练模式专用
         这里实例化IndexTTS2中核心的GPT模型并加载权重
@@ -294,22 +355,17 @@ class UniTextAudioFaceModel(nn.Module):
         from unitaf_train_component.indextts2_inference_component import UniTAFIndexTTS2
         indextts2_cfg = OmegaConf.load("checkpoints/config.yaml")  # 加载IndexTTS2配置
         gpt_ckpt = self.cfg.get("finetune_checkpoint", {}).get("tts_model")
-        if gpt_ckpt is not None:
-            indextts2_cfg.gpt_checkpoint = gpt_ckpt  # 用自己微调的权重替代预训练gpt权重
 
         tts_model = UniTAFIndexTTS2(
             cfg=indextts2_cfg,
+            gpt_ckpt=gpt_ckpt,
             model_dir="checkpoints",
             use_cuda_kernel=False,  # 禁用CUDA内核
             use_torch_compile=True  # 启用torch.compile优化
         )
         return tts_model
 
-    def build_indextts2_s2mel(
-        self,
-        cfg,
-        device,
-    ):
+    def build_indextts2_s2mel(self, cfg, device):
         """
         这里初始化用于将IndexTTS核心gpt生成的semantic token转化为mel的模块，这里不需要训练该模块直接.eval
         """
@@ -327,12 +383,7 @@ class UniTextAudioFaceModel(nn.Module):
         s2mel = s2mel.to(device)
         return s2mel.eval()
 
-    def build_unitalker_decoder_model(
-        self,
-        cfg,
-        checkpoint,
-        device,
-    ):
+    def build_unitalker_decoder_model(self, cfg, checkpoint, device):
         '''
         这里实例化UniTalker Decoder模型并加载权重
         - cfg 需要经过OmegaConf加载的
@@ -376,13 +427,58 @@ class UniTextAudioFaceModel(nn.Module):
 
 
 # ---------- 一次性检查工具方法 ----------
-def dump_param_count(model: nn.Module, name: str):
-    total = sum(p.numel() for p in model.parameters())
+def dump_param_count(model, name: str):
+    """
+    通用版：model 可以是 nn.Module，也可以是任意 Python 对象。
+    遇到 nn.Module 就累计参数，其他属性递归扫描。
+    """
+    def _count_any(obj, memo):
+        total = 0
+        if isinstance(obj, nn.Module):
+            for p in obj.parameters():
+                if id(p) not in memo:
+                    memo.add(id(p))
+                    total += p.numel()
+            return total
+        # 非 Module -> 递归扫属性
+        for attr_name in dir(obj):
+            if attr_name.startswith('_'):
+                continue
+            attr = getattr(obj, attr_name, None)
+            if isinstance(attr, nn.Module) and id(attr) not in memo:
+                memo.add(id(attr))
+                total += _count_any(attr, memo)
+        return total
+    total = _count_any(model, set())
     print(f"{name:25s}  init params : {total:,}")
 
 def dump_state_dict_count(sd: dict, name: str):
     total = sum(v.numel() for v in sd.values())
     print(f"{name:25s}  state_dict  : {total:,}")
+
+def print_model_arch(obj, name="model", indent=0):
+    """
+    通用模型结构打印：
+      - nn.Module 直接 print
+      - 非 Module 则递归扫属性，遇到 Module 就打印
+    """
+    prefix = " " * indent
+
+    if isinstance(obj, nn.Module):
+        # 是 Module，直接打印
+        print(prefix + f"{name} ({obj.__class__.__name__}):")
+        print(obj)
+        return
+
+    # 非 Module，递归扫属性
+    print(prefix + f"{name} ({obj.__class__.__name__}) -> scanning attributes:")
+    for attr_name in dir(obj):
+        if attr_name.startswith('_'):
+            continue
+        attr = getattr(obj, attr_name, None)
+        # if isinstance(attr, nn.Module):
+        print_model_arch(attr, attr_name, indent + 2)
+
 
 if __name__ == '__main__':
     """
@@ -433,9 +529,9 @@ if __name__ == '__main__':
         },
         # 仅在推理模式下指定的部分模块的微调权重
         "finetune_checkpoint": {
-            "tts_model": "./unitaf_ckpt/checkpoint-20000/tts_model.bin",
-            "audio_feature_projector": "./unitaf_ckpt/checkpoint-20000/audio_feature_projector.bin",
-            "a2f_model": "./unitaf_ckpt/checkpoint-20000/a2f_model.bin",
+            # "tts_model": "./unitaf_ckpt/lora_tts_and_a2f_25-12-17/checkpoint-20000/tts_model.pt",
+            "audio_feature_projector": "./unitaf_ckpt/lora_tts_and_a2f_25-12-17/checkpoint-59312/audio_feature_projector.pt",
+            "a2f_model": "./unitaf_ckpt/lora_tts_and_a2f_25-12-17/checkpoint-59312/a2f_model.pt",
         }
     }
 
@@ -444,12 +540,11 @@ if __name__ == '__main__':
     # unitaf = UniTextAudioFaceModel(cfg, device=torch.device("cuda:0"), mode="train")  # 训练模式
     unitaf = UniTextAudioFaceModel(cfg, device=torch.device("cuda:0"), mode="inference")  # 推理模式
 
-
-    # 1. 打印模型结构
-    print("=" * 80)
-    print("Model architecture:")
-    print("=" * 80)
-    print(unitaf)
+    # # 1. 打印模型结构
+    # print("=" * 80)
+    # print("Model architecture:")
+    # print("=" * 80)
+    # print_model_arch(unitaf, "unitaf")
 
     # # 2. 打印模型的所有层及其参数
     # print("\n" + "=" * 80)
@@ -465,19 +560,21 @@ if __name__ == '__main__':
     #             if hasattr(sub_module, 'parameters') and list(sub_module.parameters()):
     #                 print(f"    Parameters: {sum(p.numel() for p in sub_module.parameters())}")
 
-    # 3. 打印模型初始化参数量与保存的参数量
-    print("=" * 60)
-    print(">>> 初始化后参数量")
-    dump_param_count(unitaf.tts_model, "tts_model")
-    dump_param_count(unitaf.a2f_model, "a2f_model")
-    dump_param_count(unitaf.audio_feature_projector, "audio_feature_projector")
-    print("-" * 60)
-    print(">>> 自定义 state_dict 过滤后")
-    sd = unitaf.state_dict()
-    dump_state_dict_count({k: v for k, v in sd.items() if k.startswith('tts_model.')}, "tts_model")
-    dump_state_dict_count({k: v for k, v in sd.items() if k.startswith('a2f_model.')}, "a2f_model")
-    dump_state_dict_count({k: v for k, v in sd.items() if k.startswith('audio_feature_projector.')}, "audio_feature_projector")
-    print("=" * 60)
+    # # 3. 打印模型初始化参数量与保存的参数量
+    # print("=" * 60)
+    # print(">>> 初始化后参数量")
+    # dump_param_count(unitaf.tts_model, "tts_model")
+    # dump_param_count(unitaf.a2f_model, "a2f_model")
+    # dump_param_count(unitaf.audio_feature_projector, "audio_feature_projector")
+    # print("-" * 60)
+    # if unitaf.mode == "train":
+    #     print(">>> 自定义 state_dict 过滤后")
+    #     sd = unitaf.state_dict()
+    #     dump_state_dict_count({k: v for k, v in sd.items() if k.startswith('tts_model.')}, "tts_model")
+    #     dump_state_dict_count({k: v for k, v in sd.items() if k.startswith('a2f_model.')}, "a2f_model")
+    #     dump_state_dict_count({k: v for k, v in sd.items() if k.startswith('audio_feature_projector.')},
+    #                           "audio_feature_projector")
+    #     print("=" * 60)
 
     # FIXME: 这里打印出来tts_model的为什么过滤后比初始化时多？
     '''
@@ -498,6 +595,19 @@ if __name__ == '__main__':
     # print("=" * 80)
     # for name, param in unitaf.named_parameters():
     #     print(f"{name}: shape={param.shape}, dtype={param.dtype}, requires_grad={param.requires_grad}")
+
+
+    # 5. 尝试推理
+    if unitaf.mode == "inference":
+        text = "Translate for me, what is a surprise!"
+        unitaf.indextts2_unitalker_inference(
+            spk_audio_prompt='examples/voice_01.wav',
+            text=text,
+            output_dir="outputs",
+            save_name="inference_output",
+            verbose=False,
+            render=False,
+        )
 
 
 

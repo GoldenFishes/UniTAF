@@ -20,6 +20,7 @@ us at voca@tue.mpg.de
 import cv2
 import numpy as np
 import os
+import sys
 import subprocess
 import torch
 from tqdm import tqdm
@@ -160,6 +161,119 @@ def render_meshes(mesh_vertices: torch.Tensor,
         rendered_imgs = rendered_imgs.permute(0, 2, 3, 1)  # NCHW -> NHWC
     return rendered_imgs
 
+def render_meshes_np(mesh_vertices: torch.Tensor,
+                     faces: torch.Tensor,
+                     img_size: tuple = (256, 256),
+                     aa_factor: int = 1,
+                     vis_bs: int = 100):
+    """
+    纯 numpy + torch 渲染，无需 pytorch3d。
+    参数与原来 render_meshes 完全一致，返回 [N, H, W, 3] uint8 0-255
+    仅支持：正交投影 + Lambert 漫反射 + 纯色背景
+    """
+    if faces.dim() == 3:  # [N, F, 3] 或 [1, F, 3]
+        faces = faces[0]  # 取第 0 份，复用同一份面
+
+    device = mesh_vertices.device
+    N, V, _ = mesh_vertices.shape
+    F, _ = faces.shape
+    H, W = img_size
+    # 如果只有一套面，复制 N 份
+    if faces.dim() == 2 and faces.shape[0] == F:
+        faces = faces.expand(N, -1, 3)
+
+    # 1. 相机参数（正交）
+    x_max = mesh_vertices[..., 0].abs().max().item()
+    y_max = mesh_vertices[..., 1].abs().max().item()
+    scale = max(x_max, y_max) * 1.2
+    # 顶点 -> 屏幕坐标 [-1,1]
+    verts_2d = mesh_vertices[..., :2] / scale  # [N,V,2]
+
+    # 2. 光照方向（固定）
+    light_dir = torch.tensor([0, 0, 1], device=device, dtype=torch.float32)
+
+    # 3. 逐批绘制
+    imgs = []
+    for i in range(0, N, vis_bs):
+        end = min(i + vis_bs, N)
+        v2d = verts_2d[i:end]  # [bs, V, 2]
+        v3d = mesh_vertices[i:end]  # [bs, V, 3]
+        f = faces[i:end]  # [bs, F, 3]
+        bs = v2d.shape[0]
+
+        # 3-1 光栅化：自己写“z-buffer”
+        # 先初始化深度图、颜色图
+        depth = torch.full((bs, H, W), 1e6, device=device)
+        normal_map = torch.zeros((bs, H, W, 3), device=device)
+        mask = torch.zeros((bs, H, W), dtype=torch.bool, device=device)
+
+        for b in range(bs):
+            # 把三角面投影到像素坐标
+            face_2d = (v2d[b][f[b]] + 1) * 0.5  # [F,3,2]  0-1
+            face_2d = face_2d * torch.tensor([W, H], device=device)  # -> 像素
+            face_2d = face_2d.long()
+
+            # 简单扫描线：取 bbox 再判断重心坐标
+            for f_idx in range(f.shape[1]):
+                tri = face_2d[f_idx]  # [3, 2]
+                x_min, x_max = tri[:, 0].min(), tri[:, 0].max()
+                y_min, y_max = tri[:, 1].min(), tri[:, 1].max()
+                if x_max < 0 or x_min >= W or y_max < 0 or y_min >= H:
+                    continue
+                x_min = max(x_min.item(), 0)
+                x_max = min(x_max.item() + 1, W)
+                y_min = max(y_min.item(), 0)
+                y_max = min(y_max.item() + 1, H)
+
+                vs = v3d[b][f[b][f_idx]].float()  # [3,3]
+                v0, v1, v2 = vs[0], vs[1], vs[2]
+                normal = torch.cross(v1 - v0, v2 - v0)
+                normal = F.normalize(normal, dim=0)
+
+                yy, xx = torch.meshgrid(
+                    torch.arange(y_min, y_max, device=device),
+                    torch.arange(x_min, x_max, device=device),
+                    indexing='ij')
+                pix = torch.stack([xx, yy], dim=-1)  # [H', W', 2]
+
+                # 重心坐标判内点
+                def _wedge(a, b):
+                    return a[..., 0] * b[..., 1] - a[..., 1] * b[..., 0]
+
+                v0v1 = tri[1] - tri[0]
+                v0v2 = tri[2] - tri[0]
+                area = _wedge(v0v1, v0v2) + 1e-6
+                pv = pix - tri[0]
+                u = _wedge(pv, v0v2) / area
+                v = _wedge(v0v1, pv) / area
+                w = 1 - u - v
+                inside = (u >= 0) & (v >= 0) & (w >= 0)
+                if inside.sum() == 0:
+                    continue
+
+                # 计算像素深度（z-buffer）
+                z_pix = w * vs[0, 2] + u * vs[1, 2] + v * vs[2, 2]
+                update = inside & (z_pix < depth[b, y_min:y_max, x_min:x_max])
+                depth[b, y_min:y_max, x_min:x_max][update] = z_pix[update]
+                mask[b, y_min:y_max, x_min:x_max][update] = True
+                normal_map[b, y_min:y_max, x_min:x_max][update] = normal
+
+        # 3-2 Lambert 光照
+        lambert = (normal_map * light_dir).sum(dim=-1).clamp(min=0)  # [bs, H, W]
+        color = 0.9 * lambert + 0.1  # 环境光 0.1
+        color = color.unsqueeze(-1).expand(-1, -1, -1, 3)  # -> [bs, H, W, 3]
+        bg = torch.zeros_like(color)
+        rgb = torch.where(mask.unsqueeze(-1), color, bg)  # 背景纯黑
+
+        # 3-3 抗锯齿（简化版：先 2× 再插值回目标尺寸）
+        if aa_factor > 1:
+            rgb = rgb.permute(0, 3, 1, 2)  # BHWC -> BCHW
+            rgb = F.interpolate(rgb, scale_factor=1 / aa_factor, mode='bilinear', align_corners=False)
+            rgb = rgb.permute(0, 2, 3, 1)  # BCHW -> BHWC
+
+        imgs.append((rgb * 255).cpu().numpy().astype(np.uint8))
+
+    return np.concatenate(imgs, axis=0)  # [N, H, W, 3]
 
 def read_obj(in_path):
     '''
@@ -331,12 +445,13 @@ def get_obj_faces(annot_type: str):
     根据数据集类型，读取对应模板 obj 的面片索引（返回 0-base）
     '''
     template_obj_path_dict = {
-        '3DETF_blendshape_weight': 'resources/obj_template/3DETF_blendshape_weight.obj',
-        'FLAME_5023_vertices': 'resources/obj_template/FLAME_5023_vertices.obj',
-        'BIWI_23370_vertices': 'resources/obj_template/BIWI_23370_vertices.obj',
-        'flame_params_from_dadhead': 'resources/obj_template/flame_params_from_dadhead.obj',
-        'inhouse_blendshape_weight': 'resources/obj_template/inhouse_blendshape_weight.obj',
-        'meshtalk_6172_vertices': 'resources/obj_template/meshtalk_6172_vertices.obj'
+        '3DETF_blendshape_weight': 'a2f/resources/obj_template/3DETF_blendshape_weight.obj',
+        'FLAME_5023_vertices': 'a2f/resources/obj_template/FLAME_5023_vertices.obj',
+        'BIWI_23370_vertices': 'a2f/resources/obj_template/BIWI_23370_vertices.obj',
+        'flame_params_from_dadhead': 'a2f/resources/obj_template/flame_params_from_dadhead.obj',
+        'inhouse_blendshape_weight': 'a2f/resources/obj_template/inhouse_blendshape_weight.obj',
+        'meshtalk_6172_vertices': 'a2f/resources/obj_template/meshtalk_6172_vertices.obj',
+        'qxsk_inhouse_blendshape_weight': 'a2f/resources/obj_template/inhouse_blendshape_weight.obj',
     }
     # 读 obj 取面，如果 obj 是 1-base 则转 0-base
     faces = np.array(read_obj(template_obj_path_dict[annot_type])[1])
@@ -421,6 +536,82 @@ def vis_model_out_proxy():
             subprocess.run(cmd, shell=True)
             os.remove(tmp_path)   # 删除临时无声视频
 
+def render_npz_video(out_np: np.ndarray,          # [T, V, 3] 顶点序列
+                     audio_path: str,              # 完整 wav 路径；None/"" 表示无声
+                     out_dir: str,                 # 输出根目录
+                     annot_type: str,              # 显式传入模板类型，如 "qxsk_inhouse_blendshape_weight"
+                     save_images: bool = False,    # False=mp4，True=逐帧png
+                     device: str = "cuda"):
+    """
+    把「单个音频」对应的顶点序列直接渲染成视频（或逐帧png）。
+    与之前最大区别：不再遍历 npz 字典，也不再自动查表 annot_type，由调用者一次性给齐。
+    """
+    from pathlib import Path
+
+    # ---- 1. 准备目录 ----
+    os.makedirs(out_dir, exist_ok=True)
+
+    # ---- 2. 顶点转 Torch ----
+    verts = torch.Tensor(out_np).to(device)          # [T, V, 3]
+
+    # ---- 3. 读面片 ----
+    faces = get_obj_faces(annot_type)                # [F, 3] numpy
+    faces = torch.from_numpy(faces[None]).to(device) # [1, F, 3]
+
+    # ---- 4. 渲染 ----
+    img_size = (1024, 1024) if save_images else (512, 512)
+    with torch.no_grad():
+        # 这里尝试用非pytorch3d的render_meshes实现
+        img_array = render_meshes_np(verts, faces, img_size)  # [T, H, W, 4] float 0-1
+        channels = 4 if save_images else 3
+        img_array = (img_array[..., :channels].cpu().numpy() * 255).astype(np.uint8)
+
+    # ---- 5. 文件主名（取音频文件名） ----
+    out_key = Path(audio_path).stem if audio_path else "demo"  # 去掉路径和后缀
+
+    # ---- 6. 分支：png 序列 ----
+    if save_images:
+        png_dir = Path(out_dir) / annot_type / out_key
+        png_dir.mkdir(parents=True, exist_ok=True)
+        for idx, img in enumerate(img_array):
+            cv2.imwrite(str(png_dir / f"{idx:05d}.png"), img)
+        print(f">> 逐帧 png 已保存到 {png_dir}")
+        return
+
+    # ---- 7. 分支：mp4 视频 ----
+    tmp_path = str(Path(out_dir) / "tmp.mp4")
+    fps = 25 if annot_type == "BIWI_23370_vertices" else 30
+    array_to_video(img_array, tmp_path, fps=fps)
+
+    final_path = str(Path(out_dir) / f"{out_key}_{annot_type}.mp4")
+    if os.path.isfile(final_path):
+        os.remove(final_path)
+
+    # 8. 混音 or 无声
+    if audio_path and Path(audio_path).exists():
+        cmd = (f'ffmpeg -i {tmp_path} -i {audio_path} -c:v copy -c:a aac '
+               f'-shortest -strict -2 {final_path} -y')
+    else:
+        cmd = f'ffmpeg -i {tmp_path} -c:v copy {final_path} -y'
+    subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    os.remove(tmp_path)
+    print(f">> 视频已生成：{final_path}")
+
+
 # 当脚本被直接运行时，执行 vis_model_out_proxy
 if __name__ == '__main__':
-    vis_model_out_proxy()
+    '''
+    根目录下运行 python -m unitaf_train_component.render
+    '''
+    # vis_model_out_proxy()  # 当脚本被直接运行时，执行 vis_model_out_proxy
+
+    # TODO: 单独渲染的测试
+    # out_np =
+    # render_npz_video(
+    #     out_np=out_np,
+    #     audio_path="outputs/inference_output.wav",  # 原始 wav 完整路径；None=无声
+    #     out_dir="outputs",  # 想把视频/图片保存文件夹
+    #     annot_type="qxsk_inhouse_blendshape_weight",  # 你当时传给 get_vertices 的同一字符串
+    #     save_images=False,  # False=直接出 mp4；True=出逐帧 png
+    #     device="cuda"  # 或 "cpu"
+    # )

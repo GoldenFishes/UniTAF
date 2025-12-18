@@ -13,6 +13,7 @@ import time
 import librosa
 import torch
 import torchaudio
+import torch.nn as nn
 from torch.nn.utils.rnn import pad_sequence
 
 import warnings
@@ -40,9 +41,9 @@ import torch.nn.functional as F
 
 from indextts.infer_v2 import IndexTTS2, QwenEmotion
 
-class UniTAFIndexTTS2(IndexTTS2):
+class UniTAFIndexTTS2(IndexTTS2, nn.Module):
     def __init__(
-            self, cfg, model_dir="checkpoints", use_fp16=False, device=None,
+            self, cfg, gpt_ckpt=None, model_dir="checkpoints", use_fp16=False, device=None,
             use_cuda_kernel=None,use_deepspeed=False, use_accel=False, use_torch_compile=False
     ):
         '''
@@ -51,6 +52,8 @@ class UniTAFIndexTTS2(IndexTTS2):
 
         除此之外的其他初始化应当与原始IndexTTS2保持一致！
         '''
+        # 先初始化nn.Module
+        nn.Module.__init__(self)
         # 设备自动检测和设置
         if device is not None:
             self.device = device
@@ -87,14 +90,21 @@ class UniTAFIndexTTS2(IndexTTS2):
 
         # 初始化GPT文本到语义模型
         self.gpt = UnifiedVoice(**self.cfg.gpt, use_accel=self.use_accel)
-        self.gpt_path = os.path.join(self.model_dir, self.cfg.gpt_checkpoint)
-        load_checkpoint(self.gpt, self.gpt_path)
+        if gpt_ckpt is not None:  # 这里增加支持外部直接指定gpt权重
+            # 由于load_checkpoint配置文件默认加载路径不同，因此这里直接自己实现而不是调用官方load_checkpoint()
+            self.gpt_path = gpt_ckpt
+            checkpoint = torch.load(self.gpt_path, map_location='cpu')
+            checkpoint = checkpoint['model'] if 'model' in checkpoint else checkpoint
+            self.gpt.load_state_dict(checkpoint, strict=True)
+        else:
+            self.gpt_path = os.path.join(self.model_dir, self.cfg.gpt_checkpoint)
+            load_checkpoint(self.gpt, self.gpt_path)
         self.gpt = self.gpt.to(self.device)
         if self.use_fp16:
             self.gpt.eval().half()  # 设置为评估模式并使用半精度
         else:
             self.gpt.eval()
-        print(">> GPT weights restored from:", self.gpt_path)
+        print("[UniTAFIndexTTS2] GPT weights restored from:", self.gpt_path)
 
         # DeepSpeed支持性检查
         if use_deepspeed:
@@ -269,7 +279,7 @@ class UniTAFIndexTTS2(IndexTTS2):
                     verbose, max_text_tokens_per_segment, stream_return, more_segment_before, **generation_kwargs
                 ))[0]
             except IndexError:
-                return None
+                return
 
     def infer_generator(self, spk_audio_prompt, text,
             emo_audio_prompt=None, emo_alpha=1.0,
@@ -641,11 +651,11 @@ class UniTAFIndexTTS2(IndexTTS2):
                 # wavs.append(wav[:, :-512])
                 wavs.append(wav.cpu())  # 转移到CPU并保存 / to cpu before saving
                 if stream_return:
-                    yield wav.cpu(), audio_feature  # 流式返回当前段
+                    yield sampling_rate, wav.cpu(), audio_feature  # 流式返回当前段
                     if silence == None:
                         silence = self.interval_silence(wavs, sampling_rate=sampling_rate,
                                                         interval_silence=interval_silence)
-                    yield silence, None  # 返回静音段
+                    yield sampling_rate, silence, None  # 返回静音段
 
         # 合成结束 ------------------------------------------------
         end_time = time.perf_counter()
@@ -671,12 +681,10 @@ class UniTAFIndexTTS2(IndexTTS2):
 
         # 保存音频 / save audio
         wav = wav.cpu()  # 确保在CPU上 / to cpu
-        if stream_return:
-            return None
-        # 返回以符合Gradio的格式要求
-        wav_data = wav.type(torch.int16)
-        wav_data = wav_data.numpy().T  # 转置为(采样点数, 声道数)格式
-        yield (sampling_rate, wav_data, audio_feature)
+        # # 返回以符合Gradio的格式要求
+        # wav_data = wav.type(torch.int16)
+        # wav_data = wav_data.numpy().T  # 转置为(采样点数, 声道数)格式
+        yield sampling_rate, wav, audio_feature
 
 
 def find_most_similar_cosine(query_vector, matrix):
