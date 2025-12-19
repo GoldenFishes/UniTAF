@@ -682,6 +682,8 @@ class IndexTTS2:
                         **generation_kwargs
                     )
 
+                    # print(f"GPT生成codes, codes:{codes[:5]}, speech_conditioning_latent:{speech_conditioning_latent[:5]}")
+
                 gpt_gen_time += time.perf_counter() - m_start_time
 
                 # 检查是否因超过最大长度而停止生成
@@ -979,31 +981,63 @@ class QwenEmotion:
 
         return self.convert(content)  # 返回转换后的标准格式
 
+def print_gpt_weights(model, max_rows=20):
+    """
+    打印 IndexTTS2 中 GPT 部分的权重
+    max_rows : 最多打印多少行，防止刷屏
+    """
+    gpt = model.gpt          # 这是 nn.Module
+    count = 0
+    for name, param in gpt.named_parameters():
+        if not param.requires_grad:      # 冻结的也打，可自己过滤
+            continue
+        print(f"{name:<60}  {tuple(param.shape)}  "
+              f"min={param.min().item():+.4f}  "
+              f"max={param.max().item():+.4f}  "
+              f"mean={param.mean().item():+.4f}  "
+              f"std={param.std().item():+.4f}")
+        count += 1
+        if count >= max_rows:
+            print("... 已截断，继续打印请调大 max_rows ...")
+            break
+    print(f"\nGPT 权重总计 {count} 个 tensor.")
+
 
 if __name__ == "__main__":
-    prompt_wav = "examples/voice_01.wav"
-    text = '欢迎大家来体验indextts2，并给予我们意见与反馈，谢谢大家。'
-
-    tts = IndexTTS2(
+    '''
+    单独测试 python -m indextts.infer_v2
+    '''
+    tts_model = IndexTTS2(
         cfg_path="checkpoints/config.yaml",     # 配置文件路径
-        model_dir="checkpoints", 
+        model_dir="checkpoints",
         use_cuda_kernel=False,                  # 禁用CUDA内核
         use_torch_compile=True                  # 启用torch.compile优化
     )
 
-    # 进行语音合成推理
-    tts.infer(spk_audio_prompt=prompt_wav, text=text, output_path="gen.wav", verbose=True)
+    # print_gpt_weights(tts_model)
 
-    # 性能测试：生成不同长度文本的语音并计时
-    char_size = 5  # 测试文本字符数
-    import string
-    time_buckets = []  # 时间记录列表
-    for i in range(10):  # 进行10次测试
-        # 生成随机文本
-        text = ''.join(random.choices(string.ascii_letters, k=char_size))
-        start_time = time.time()  # 开始计时
-        # 进行语音合成
-        tts.infer(spk_audio_prompt=prompt_wav, text=text, output_path="gen.wav", verbose=True)
-        time_buckets.append(time.time() - start_time)  # 记录耗时
+    text = "清晨的阳光透过窗帘洒在书桌上，新的一天开始了。窗外鸟儿欢快地歌唱，空气中弥漫着淡淡的花香。"
+    tts_model.infer(
+        spk_audio_prompt='examples/voice_zhongli.wav',
+        text=text,
+        output_path="outputs/IndexTTS2_output.wav",
+        emo_alpha=0.6,
+        use_emo_text=True,
+        emo_text=text,  # 情感控制选择从传入的情感文本中推断，不传额外用于推断的情感文本时则直接从目标文本中推断。
+        verbose=False
+    )
 
-    print(time_buckets)
+
+    # # 性能测试：生成不同长度文本的语音并计时
+    # char_size = 5  # 测试文本字符数
+    # import string
+    # time_buckets = []  # 时间记录列表
+    # for i in range(10):  # 进行10次测试
+    #     # 生成随机文本
+    #     text = ''.join(random.choices(string.ascii_letters, k=char_size))
+    #     start_time = time.time()  # 开始计时
+    #     # 进行语音合成
+    #     tts.infer(spk_audio_prompt=prompt_wav, text=text, output_path="gen.wav", verbose=True)
+    #     time_buckets.append(time.time() - start_time)  # 记录耗时
+    #
+    # print(time_buckets)

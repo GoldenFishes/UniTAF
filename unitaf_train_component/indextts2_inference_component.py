@@ -41,7 +41,12 @@ import torch.nn.functional as F
 
 from indextts.infer_v2 import IndexTTS2, QwenEmotion
 
-class UniTAFIndexTTS2(IndexTTS2, nn.Module):
+# 导入工具方法的包
+import hashlib, itertools
+from collections import OrderedDict
+
+
+class UniTAFIndexTTS2(IndexTTS2):
     def __init__(
             self, cfg, gpt_ckpt=None, model_dir="checkpoints", use_fp16=False, device=None,
             use_cuda_kernel=None,use_deepspeed=False, use_accel=False, use_torch_compile=False
@@ -52,8 +57,8 @@ class UniTAFIndexTTS2(IndexTTS2, nn.Module):
 
         除此之外的其他初始化应当与原始IndexTTS2保持一致！
         '''
-        # 先初始化nn.Module
-        nn.Module.__init__(self)
+        # # 先初始化nn.Module
+        # nn.Module.__init__(self)  # 这里给UniTAFIndexTTS2加上nn.Module仅仅为了方便打印模型权重
         # 设备自动检测和设置
         if device is not None:
             self.device = device
@@ -543,6 +548,8 @@ class UniTAFIndexTTS2(IndexTTS2, nn.Module):
                         **generation_kwargs
                     )
 
+                    # print(f"GPT生成codes, codes:{codes[:5]}, speech_conditioning_latent:{speech_conditioning_latent[:5]}")
+
                 gpt_gen_time += time.perf_counter() - m_start_time
 
                 # 检查是否因超过最大长度而停止生成
@@ -701,10 +708,258 @@ def find_most_similar_cosine(query_vector, matrix):
     return most_similar_index
 
 
+# 工具方法 ============================================================================
+
+def print_gpt_weights(model, max_rows=20):
+    """
+    打印 IndexTTS2 中 GPT 部分的权重
+    max_rows : 最多打印多少行，防止刷屏
+    """
+    gpt = model.gpt          # 这是 nn.Module
+    count = 0
+    for name, param in gpt.named_parameters():
+        if not param.requires_grad:      # 冻结的也打，可自己过滤
+            continue
+        print(f"{name:<60}  {tuple(param.shape)}  "
+              f"min={param.min().item():+.4f}  "
+              f"max={param.max().item():+.4f}  "
+              f"mean={param.mean().item():+.4f}  "
+              f"std={param.std().item():+.4f}")
+        count += 1
+        if count >= max_rows:
+            print("... 已截断，继续打印请调大 max_rows ...")
+            break
+    print(f"\nGPT 权重总计 {count} 个 tensor.")
+
+@torch.no_grad()
+def compare_modules(mod_a, mod_b, name_a='A', name_b='B', rtol=1e-5, atol=1e-8):
+    """
+    比较两个 nn.Module 的 state_dict
+    """
+    sd_a = mod_a.state_dict()
+    sd_b = mod_b.state_dict()
+
+    # 1. 统一 key 集合
+    keys_a, keys_b = set(sd_a.keys()), set(sd_b.keys())
+    only_a = keys_a - keys_b
+    only_b = keys_b - keys_a
+    common = keys_a & keys_b
+
+    diff = 0
+    # 2. 先报缺失
+    for k in only_a:
+        print(f'[KEY MISSING] {k} 只在 {name_a} 出现')
+        diff += 1
+    for k in only_b:
+        print(f'[KEY MISSING] {k} 只在 {name_b} 出现')
+        diff += 1
+
+    # 3. 再比对公共 key
+    for k in sorted(common):
+        va, vb = sd_a[k], sd_b[k]
+        # 防御：确保都是 Tensor
+        if not isinstance(va, torch.Tensor) or not isinstance(vb, torch.Tensor):
+            print(f'[TYPE DIFF]   {k}  {name_a}:{type(va)} vs {name_b}:{type(vb)}')
+            diff += 1
+            continue
+
+        if va.shape != vb.shape:
+            print(f'[SHAPE DIFF]  {k}  {name_a}:{va.shape} vs {name_b}:{vb.shape}')
+            diff += 1
+            continue
+
+        if not torch.allclose(va, vb, rtol=rtol, atol=atol):
+            ha = hashlib.sha256(va.cpu().numpy().tobytes()).hexdigest()[:8]
+            hb = hashlib.sha256(vb.cpu().numpy().tobytes()).hexdigest()[:8]
+            print(f'[VALUE DIFF]  {k}  hash {name_a}:{ha} vs {name_b}:{hb}')
+            diff += 1
+    return diff
+
+def deep_compare(container_a, container_b, name_a='UniTAF', name_b='IndexTTS2', verbose_same=False):
+    """
+    对两个任意容器（非 nn.Module）做深度模块比对
+    verbose_same=True  才打印完全一致的模块
+    """
+    mods_a = collect_nn_modules(container_a)
+    mods_b = collect_nn_modules(container_b)
+
+    # 统一 key：去掉前缀，只保留相对路径
+    def norm(k):
+        k = re.sub(r'^(unitaf_)?(indextts2\.)?', '', k, flags=re.I)
+        return k
+
+    keys_a = {norm(k): k for k in mods_a.keys()}
+    keys_b = {norm(k): k for k in mods_b.keys()}
+
+    common = sorted(set(keys_a) & set(keys_b))
+    only_a = set(keys_a) - set(keys_b)
+    only_b = set(keys_b) - set(keys_a)
+
+    if only_a or only_b:
+        print('>>> 仅存在于 {} 的模块：{}'.format(name_a, list(only_a)))
+        print('>>> 仅存在于 {} 的模块：{}'.format(name_b, list(only_b)))
+
+    total_diff = 0
+    for k in common:
+        ka, kb = keys_a[k], keys_b[k]
+        diff = compare_modules(mods_a[ka], mods_b[kb],
+                               name_a=f'{name_a}.{k}', name_b=f'{name_b}.{k}')
+        total_diff += diff
+        # 关键：只有差异或 verbose 才打印
+        if diff > 0 or verbose_same:
+            print(f'\n===== 比对模块 {k} =====')
+            if diff == 0:
+                print('  权重完全一致')
+
+    print(f'\n>>> 总计发现 {total_diff} 处权重差异')
+
+def collect_nn_modules(obj, prefix=''):
+    """
+    递归扫描任意 Python 对象，收集所有 nn.Module 类型的属性（含嵌套）
+    返回 OrderedDict:  相对路径 -> Module
+    """
+    ans = OrderedDict()
+    if isinstance(obj, torch.nn.Module):
+        # 先把自己挂上去（如果愿意）
+        if prefix:
+            ans[prefix] = obj
+        # 再扫子模块
+        for name, module in obj.named_children():
+            ans.update(collect_nn_modules(module, prefix+f'{name}.'))
+    elif hasattr(obj, '__dict__'):      # 普通对象，扫成员变量
+        for name, attr in obj.__dict__.items():
+            ans.update(collect_nn_modules(attr, prefix+f'{name}.'))
+    return ans
+
+def skeleton(obj, name='model'):
+    """
+    只保留「含参数」的叶子 Module，返回 路径 -> (类名, [para_shape, ...])
+    """
+    sk = OrderedDict()
+    for path, mod in collect_nn_modules(obj).items():
+        # 只保留叶子层（不含子节点的 Module）
+        if not list(mod.children()) and list(mod.parameters()):
+            cls   = mod.__class__.__name__
+            shapes = [tuple(p.shape) for p in mod.parameters()]
+            sk[path] = (cls, shapes)
+    return sk
+
+def print_diff(a_name, a_sk, b_name, b_sk):
+    keys_a, keys_b = set(a_sk), set(b_sk)
+    only_a = keys_a - keys_b
+    only_b = keys_b - keys_a
+    common = keys_a & keys_b
+
+    print(f'\n========== 仅存在于 {a_name} 的层 ==========')
+    for k in sorted(only_a):
+        cls, sha = a_sk[k]
+        print(f'{k:60s}  {cls:15s}  {sha}')
+
+    print(f'\n========== 仅存在于 {b_name} 的层 ==========')
+    for k in sorted(only_b):
+        cls, sha = b_sk[k]
+        print(f'{k:60s}  {cls:15s}  {sha}')
+
+    print(f'\n========== 双方都有但形状不同的层 ==========')
+    for k in sorted(common):
+        cls_a, sha_a = a_sk[k]
+        cls_b, sha_b = b_sk[k]
+        if sha_a != sha_b:
+            print(f'{k:60s}  {a_name}:{sha_a}')
+            print(f'{"":60s}  {b_name}:{sha_b}')
+
+    print(f'\n========== 双方都有且形状一致的层（共 {len(common)} 个） ==========')
+    count = 0
+    for k in sorted(common):
+        cls_a, sha_a = a_sk[k]
+        cls_b, sha_b = b_sk[k]
+        if sha_a == sha_b and cls_a == cls_b:
+            count += 1
+            if count <= 50:  # 防刷屏，只打前 50 条
+                print(f'{k:60s}  {cls_a:15s}  {sha_a}')
+    if count > 50:
+        print(f'  ... 还有 {count - 50} 个完全一致，已省略 ...')
+    print(f'>>> 双方完全一致的层共计 {count} 个')
+
+def compare_tts_pairs():
+    '''
+    加载UniTAF实现的UniTAFIndexTTS2和原始IndexTTS2对比模型权重和结构
+    '''
+    from omegaconf import OmegaConf
+    indextts2_cfg = OmegaConf.load("checkpoints/config.yaml")  # 加载IndexTTS2配置
+
+    unitaf_tts_model = UniTAFIndexTTS2(
+        cfg=indextts2_cfg,
+        # gpt_ckpt="./unitaf_ckpt/lora_tts_and_a2f_25-12-17/checkpoint-20000/tts_model.pt",
+        gpt_ckpt=None,  # 如果需要单独指定gpt_ckpt路径
+        model_dir="checkpoints",
+        use_cuda_kernel=False,  # 禁用CUDA内核
+        use_torch_compile=True  # 启用torch.compile优化
+    )
+
+    tts_model = IndexTTS2(
+        cfg_path="checkpoints/config.yaml",  # 配置文件路径
+        model_dir="checkpoints",
+        use_cuda_kernel=False,  # 禁用CUDA内核
+        use_torch_compile=True  # 启用torch.compile优化
+    )
+
+    # 深度比对
+    deep_compare(unitaf_tts_model, tts_model,
+                 name_a='UniTAFIndexTTS2', name_b='IndexTTS2')
+
+    # print_gpt_weights(tts_model)
+
+    unitaf_sk = skeleton(unitaf_tts_model, 'UniTAFIndexTTS2')
+    tts_sk = skeleton(tts_model, 'IndexTTS2')
+
+    print_diff('UniTAFIndexTTS2', unitaf_sk, 'IndexTTS2', tts_sk)
+
+    '''
+    结果表明模型权重和结构均相同
+    '''
 
 
+if __name__ == "__main__":
+    '''
+    单独测试UniTAFIndexTTS2的音频推理 python -m unitaf_train_component.indextts2_inference_component
+    '''
+    # 比较我们实现的UniTAFIndexTTS2和IndexTTS2在权重和结构上是否有区别
+    compare_tts_pairs()
 
-
+    # from omegaconf import OmegaConf
+    # indextts2_cfg = OmegaConf.load("checkpoints/config.yaml")  # 加载IndexTTS2配置
+    #
+    # unitaf_tts_model = UniTAFIndexTTS2(
+    #     cfg=indextts2_cfg,
+    #     gpt_ckpt=None,  # 如果需要单独指定gpt_ckpt路径
+    #     model_dir="checkpoints",
+    #     use_cuda_kernel=False,  # 禁用CUDA内核
+    #     use_torch_compile=True  # 启用torch.compile优化
+    # )
+    #
+    # # 实际调用
+    # text = "清晨的阳光透过窗帘洒在书桌上，新的一天开始了。窗外鸟儿欢快地歌唱，空气中弥漫着淡淡的花香。"
+    # sr, wav, audio_feature = unitaf_tts_model.infer(
+    #     spk_audio_prompt='examples/voice_zhongli.wav',
+    #     text=text,
+    #     emo_alpha=0.6,
+    #     use_emo_text=True,
+    #     emo_text=text,  # 情感控制选择从传入的情感文本中推断，不传额外用于推断的情感文本时则直接从目标文本中推断。
+    #     verbose=False
+    # )
+    #
+    # tts_output_path = "outputs/UniTAF_output.wav"
+    #
+    # # 直接保存音频到指定路径中
+    # if os.path.isfile(tts_output_path):
+    #     os.remove(tts_output_path)
+    #     print(">> remove old wav file:", tts_output_path)
+    # if os.path.dirname(tts_output_path) != "":
+    #     os.makedirs(os.path.dirname(tts_output_path), exist_ok=True)
+    #
+    # torchaudio.save(tts_output_path, wav, sr)  # 保存为16位PCM
+    # print(">> wav file saved to:", tts_output_path)
 
 
 

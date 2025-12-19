@@ -10,7 +10,6 @@
 在推理过程中，tts_model一般为原本完整的tts模型
 
 '''
-from omegaconf import OmegaConf
 import sys
 import os
 import numpy as np
@@ -122,8 +121,8 @@ class UniTextAudioFaceModel(nn.Module):
         # TTS部分（IndexTTS2）所需参数
         spk_audio_prompt,
         text,
-        output_dir,
-        save_name="output",
+        tts_output_path,
+        a2f_output_path,
         emo_audio_prompt=None,
         emo_alpha=1.0,
         emo_vector=None,
@@ -136,7 +135,7 @@ class UniTextAudioFaceModel(nn.Module):
         stream_return=False,
         more_segment_before=0,
         # a2f部分所需参数
-        render=False
+        render=False,
     ):
         '''
         UniTAF联合模型的推理流程，接收所有原始IndexTTS2的参数
@@ -146,8 +145,8 @@ class UniTextAudioFaceModel(nn.Module):
         以下为控制TTS生成的参数
             spk_audio_prompt： reference audio 语音克隆参考音频
             text： 目标文本，生成根据这个文本对应的语音
-            output_dir： 生成的音频和表情保存的路径
-            save_name： 保存的音频和表情的文件名
+            tts_output_path： 生成的音频路径 .wav 后缀
+            a2f_output_path： 生成的表情路径 .npz 后缀
             emo_audio_prompt： 传入用于控制情感的提示音频（如果没有则一般从spk_audio_prompt中获得）
             emo_alpha： 情感控制作用系数，使用文本情感模式时使用大约 0.6（或更低）的 emo_alpha
             emo_vector： 直接指定具体的情感向量，传入时以该emo_vector为准
@@ -188,23 +187,23 @@ class UniTextAudioFaceModel(nn.Module):
             sr, wav, audio_feature = tts_gen
 
         # 保存音频
-        if output_dir:
-            wav_path = Path(output_dir) / f"{save_name}.wav"
+        if tts_output_path:
             # 直接保存音频到指定路径中
-            if os.path.isfile(wav_path):
-                os.remove(wav_path)
-                print(">> remove old wav file:", wav_path)
-            if os.path.dirname(wav_path) != "":
-                os.makedirs(os.path.dirname(wav_path), exist_ok=True)
+            if os.path.isfile(tts_output_path):
+                os.remove(tts_output_path)
+                print(">> remove old wav file:", tts_output_path)
+            if os.path.dirname(tts_output_path) != "":
+                os.makedirs(os.path.dirname(tts_output_path), exist_ok=True)
 
-            torchaudio.save(wav_path, wav, sr)  # 保存为16位PCM
-            print(">> wav file saved to:", wav_path)
+            torchaudio.save(tts_output_path, wav, sr)  # 保存为16位PCM
+            print(">> wav file saved to:", tts_output_path)
+
 
         # 2. projector
         audio_feature = F.pad(audio_feature, (0, 0, 0, 1), mode='constant', value=0)  # (B, L+1, 1024)
         audio_feature = self.audio_feature_projector(audio_feature)
 
-        # 2. a2f生成
+        # 3. a2f生成
         '''
         face_template: 用于表示说话人静态的脸形，因此是一个与标注格式的表示形状FLAME相同的初始偏移量
             但是在arkit中我们不需要这个，故而保持和我们标注格式相同维度的0向量即可
@@ -234,10 +233,9 @@ class UniTextAudioFaceModel(nn.Module):
         # 获取到顶点数据
         out = self.a2f_loss_module.get_vertices(out_motion.cuda(), annot_type="qxsk_inhouse_blendshape_weight")
 
+        # 处理out以便保存
         if isinstance(out, torch.Tensor):
-            # 如果 out 是 CUDA tensor，先移到 CPU
-            if out.is_cuda:
-                # print("将 out 从 CUDA 移到 CPU")
+            if out.is_cuda:  # 如果 out 是 CUDA tensor，先移到 CPU
                 out_cpu = out.cpu()
             else:
                 out_cpu = out
@@ -245,26 +243,25 @@ class UniTextAudioFaceModel(nn.Module):
         else:
             out_np = out  # 如果已经是 numpy 或其他类型
 
-        if output_dir:
-            face_path = Path(output_dir) / f"{save_name}.npz"
-            if os.path.isfile(face_path):
-                os.remove(face_path)
-                print(">> remove old wav file:", face_path)
-            if os.path.dirname(face_path) != "":
-                os.makedirs(os.path.dirname(face_path), exist_ok=True)
+        if a2f_output_path:
+            if os.path.isfile(a2f_output_path):
+                os.remove(a2f_output_path)
+                print(">> remove old wav file:", a2f_output_path)
+            if os.path.dirname(a2f_output_path) != "":
+                os.makedirs(os.path.dirname(a2f_output_path), exist_ok=True)
             # 保存结果为npz文件
-            np.savez(face_path, out_np)
-            print(f">> face results save to {face_path}")
+            np.savez(a2f_output_path, out_np)
+            print(f">> face results save to {a2f_output_path}")
 
-        if render:
-            # print("目前不支持直接渲染，因为UniTAF运行环境为pytorch2.8.0+cu128，而渲染所需的依赖为pytorch3d（最高仅支持到怕pytorch2.4）")
-            # pass
+        if tts_output_path and a2f_output_path and render:
             from unitaf_train_component.render import render_npz_video
+            parent_dir = Path(a2f_output_path).parent
+            parent_str = parent_dir.as_posix()
             # 进行渲染
             render_npz_video(
                 out_np=out_np,
-                audio_path=wav_path,  # 原始 wav 完整路径；None=无声
-                out_dir=output_dir,  # 想把视频/图片保存文件夹
+                audio_path=tts_output_path,  # 原始 wav 完整路径；None=无声
+                out_dir=parent_str,  # 想把视频/图片保存文件夹
                 annot_type="qxsk_inhouse_blendshape_weight",  # 你当时传给 get_vertices 的同一字符串
                 save_images=False,  # False=直接出 mp4；True=出逐帧 png
                 device="cuda"  # 或 "cpu"
@@ -355,6 +352,7 @@ class UniTextAudioFaceModel(nn.Module):
         from unitaf_train_component.indextts2_inference_component import UniTAFIndexTTS2
         indextts2_cfg = OmegaConf.load("checkpoints/config.yaml")  # 加载IndexTTS2配置
         gpt_ckpt = self.cfg.get("finetune_checkpoint", {}).get("tts_model")
+        # print("[UniTextAudioFaceModel.__init__()] gpt_ckpt:", gpt_ckpt)
 
         tts_model = UniTAFIndexTTS2(
             cfg=indextts2_cfg,
@@ -541,13 +539,13 @@ if __name__ == '__main__':
     # unitaf = UniTextAudioFaceModel(cfg, device=torch.device("cuda:0"), mode="train")  # 训练模式
     unitaf = UniTextAudioFaceModel(cfg, device=torch.device("cuda:0"), mode="inference")  # 推理模式
 
-    # # 1. 打印模型结构
+    # # 1. 打印模型结构 FIXME: 推理状态下 tts_model不是nn.Model类型这里会打不出来
     # print("=" * 80)
     # print("Model architecture:")
     # print("=" * 80)
     # print_model_arch(unitaf, "unitaf")
 
-    # # 2. 打印模型的所有层及其参数
+    # # 2. 打印模型的所有层及其参数  FIXME: 推理状态下 tts_model不是nn.Model类型这里会打不出来
     # print("\n" + "=" * 80)
     # print("Model layers and parameters:")
     # print("=" * 80)
@@ -561,7 +559,7 @@ if __name__ == '__main__':
     #             if hasattr(sub_module, 'parameters') and list(sub_module.parameters()):
     #                 print(f"    Parameters: {sum(p.numel() for p in sub_module.parameters())}")
 
-    # # 3. 打印模型初始化参数量与保存的参数量
+    # # 3. 打印模型初始化参数量与保存的参数量  FIXME: 推理状态下 tts_model不是nn.Model类型这里会打不出来
     # print("=" * 60)
     # print(">>> 初始化后参数量")
     # dump_param_count(unitaf.tts_model, "tts_model")
@@ -600,14 +598,17 @@ if __name__ == '__main__':
 
     # 5. 尝试推理
     if unitaf.mode == "inference":
-        text = "Translate for me, what is a surprise!"
+        text = "清晨的阳光透过窗帘洒在书桌上，新的一天开始了。窗外鸟儿欢快地歌唱，空气中弥漫着淡淡的花香。"
         unitaf.indextts2_unitalker_inference(
-            spk_audio_prompt='examples/voice_01.wav',
+            spk_audio_prompt='examples/voice_zhongli.wav',
             text=text,
-            output_dir="outputs",
-            save_name="inference_output",
-            verbose=False,
-            render=True,
+            tts_output_path="outputs/UniTAF_output.wav",
+            a2f_output_path="outputs/UniTAF_output.npz",
+            emo_alpha=0.6,
+            use_emo_text=True,
+            emo_text=text,  # 情感控制选择从传入的情感文本中推断，不传额外用于推断的情感文本时则直接从目标文本中推断。
+            verbose=False,   # 音频生成过程是否打印
+            render=False,  #是否渲染表情
         )
 
 

@@ -53,75 +53,7 @@ from tqdm import tqdm
 import shutil
 import itertools
 from indextts.infer_v2 import IndexTTS2
-
-
-"""
-# 1. 用一个参考音频文件合成新语音（语音克隆）
-text = "Translate for me, what is a surprise!"
-tts.infer(
-    spk_audio_prompt='examples/voice_01.wav',
-    text=text,
-    output_path="gen.wav",
-    verbose=True
-)
-
-# 2. 使用一个独立的情感参考音频文件来调节语音合成
-text = "酒楼丧尽天良，开始借机竞拍房间，哎，一群蠢货。"
-tts.infer(
-    spk_audio_prompt='examples/voice_07.wav',
-    text=text,
-    output_path="gen.wav",
-    emo_audio_prompt="examples/emo_sad.wav",
-    # 当指定情感参考音频文件时，你可以选择设置 emo_alpha 来调整对输出的影响程度。
-    emo_alpha=0.9,  # 有效范围为 0.0 - 1.0，默认值为 1.0
-    verbose=True
-)
-
-# 3. 也可以省略情感参考音频，改用 一个8浮点表，指定每种情绪的强度，顺序如下：
-# [开心、  愤怒、  悲伤、  害怕、    厌恶、       忧郁、       惊讶、    平静]
-# [happy, angry, sad, afraid, disgusted, melancholic, surprised, calm]
-text = "哇塞！这个爆率也太高了！欧皇附体了！"
-tts.infer(
-    spk_audio_prompt='examples/voice_10.wav',
-    text=text,
-    output_path="gen.wav",
-    emo_vector=[0, 0, 0, 0, 0, 0, 0.45, 0],
-    use_random=False, # 还可以使用 use_random 参数在推理过程中引入随机性; 随机采样会降低语音合成的声音克隆精度.
-    verbose=True
-)
-
-# 4. 或者，也可以启用 use_emo_text 根据提供的文字脚本引导情绪。
-# 还文字脚本会自动转换为情感向量。建议在使用文本情感模式时使用大约 0.6（或更低）的 emo_alpha，这样语音听起来更自然。
-text = "快躲起来！是他要来了！他要来抓我们了！"
-tts.infer(
-    spk_audio_prompt='examples/voice_12.wav',
-    text=text,
-    output_path="gen.wav",
-    emo_alpha=0.6,
-    use_emo_text=True,  # 根据提供的文字脚本引导情绪
-    use_random=False,
-    verbose=True
-)
-
-# 5. 也可以通过 emo_text 参数直接提供特定的文本情感描述。
-# 你的情感文本随后会自动转换为情感向量。这样你就能分别控制文本脚本和文本情感描述：
-text = "快躲起来！是他要来了！他要来抓我们了！"
-emo_text = "你吓死我了！你是鬼吗？"
-tts.infer(
-    spk_audio_prompt='examples/voice_12.wav',
-    text=text,
-    output_path="gen.wav",
-    emo_alpha=0.6,
-    use_emo_text=True,
-    emo_text=emo_text,  # 情感控制选择从传入的情感文本中推断，不传额外用于推断的情感文本时则直接从目标文本中推断。
-    use_random=False,
-    verbose=True
-)
-
-# 6. IndexTTS-2仍然支持一代的拼音功能，支持精确标注发音，例如：
-text = "之前你做DE5很好，所以这一次也DEI3做DE2很好才XING2，如果这次目标完成得不错的话，我们就直接打DI1去银行取钱。"
-"""
-
+from unitaf_train_component.indextts2_inference_component import UniTAFIndexTTS2
 
 class IndexTTSExperiment:
     def __init__(
@@ -875,7 +807,6 @@ if __name__ == "__main__":
     # ]
     # experiment.experiment4_specific_transition(specific_pairs, steps=5)
 
-
     # 实验5：emo_alpha控制不同情感的强度
     # experiment.experiment5_emo_alpha_sensitivity()
 
@@ -884,14 +815,15 @@ if __name__ == "__main__":
 
 
     # 不使用批量实验，单独测试
-    text = "哇塞！这个爆率也太高了！欧皇附体了！"
+    text = "清晨的阳光透过窗帘洒在书桌上，新的一天开始了。窗外鸟儿欢快地歌唱，空气中弥漫着淡淡的花香。"
     experiment.tts.infer(
-        spk_audio_prompt='examples/voice_10.wav',
+        spk_audio_prompt='examples/voice_zhongli.wav',
         text=text,
-        output_path="gen.wav",
-        emo_vector=[0, 0, 0, 0, 0, 0, 0.45, 0],
-        use_random=False,  # 还可以使用 use_random 参数在推理过程中引入随机性; 随机采样会降低语音合成的声音克隆精度.
-        verbose=True
+        output_path="outputs/IndexTTS2_output.wav",
+        emo_alpha=0.6,
+        use_emo_text=True,
+        emo_text=text,  # 情感控制选择从传入的情感文本中推断，不传额外用于推断的情感文本时则直接从目标文本中推断。
+        verbose=False
     )
     # text = "快躲起来！是他要来了！他要来抓我们了！"
     # experiment.tts.infer(
@@ -903,4 +835,71 @@ if __name__ == "__main__":
     #     use_random=False,
     #     verbose=True
     # )
+
+    """
+    # 1. 用一个参考音频文件合成新语音（语音克隆）
+    text = "Translate for me, what is a surprise!"
+    tts.infer(
+        spk_audio_prompt='examples/voice_01.wav',
+        text=text,
+        output_path="gen.wav",
+        verbose=True
+    )
+
+    # 2. 使用一个独立的情感参考音频文件来调节语音合成
+    text = "酒楼丧尽天良，开始借机竞拍房间，哎，一群蠢货。"
+    tts.infer(
+        spk_audio_prompt='examples/voice_07.wav',
+        text=text,
+        output_path="gen.wav",
+        emo_audio_prompt="examples/emo_sad.wav",
+        # 当指定情感参考音频文件时，你可以选择设置 emo_alpha 来调整对输出的影响程度。
+        emo_alpha=0.9,  # 有效范围为 0.0 - 1.0，默认值为 1.0
+        verbose=True
+    )
+
+    # 3. 也可以省略情感参考音频，改用 一个8浮点表，指定每种情绪的强度，顺序如下：
+    # [开心、  愤怒、  悲伤、  害怕、    厌恶、       忧郁、       惊讶、    平静]
+    # [happy, angry, sad, afraid, disgusted, melancholic, surprised, calm]
+    text = "哇塞！这个爆率也太高了！欧皇附体了！"
+    tts.infer(
+        spk_audio_prompt='examples/voice_10.wav',
+        text=text,
+        output_path="gen.wav",
+        emo_vector=[0, 0, 0, 0, 0, 0, 0.45, 0],
+        use_random=False, # 还可以使用 use_random 参数在推理过程中引入随机性; 随机采样会降低语音合成的声音克隆精度.
+        verbose=True
+    )
+
+    # 4. 或者，也可以启用 use_emo_text 根据提供的文字脚本引导情绪。
+    # 还文字脚本会自动转换为情感向量。建议在使用文本情感模式时使用大约 0.6（或更低）的 emo_alpha，这样语音听起来更自然。
+    text = "快躲起来！是他要来了！他要来抓我们了！"
+    tts.infer(
+        spk_audio_prompt='examples/voice_12.wav',
+        text=text,
+        output_path="gen.wav",
+        emo_alpha=0.6,
+        use_emo_text=True,  # 根据提供的文字脚本引导情绪
+        use_random=False,
+        verbose=True
+    )
+
+    # 5. 也可以通过 emo_text 参数直接提供特定的文本情感描述。
+    # 你的情感文本随后会自动转换为情感向量。这样你就能分别控制文本脚本和文本情感描述：
+    text = "快躲起来！是他要来了！他要来抓我们了！"
+    emo_text = "你吓死我了！你是鬼吗？"
+    tts.infer(
+        spk_audio_prompt='examples/voice_12.wav',
+        text=text,
+        output_path="gen.wav",
+        emo_alpha=0.6,
+        use_emo_text=True,
+        emo_text=emo_text,  # 情感控制选择从传入的情感文本中推断，不传额外用于推断的情感文本时则直接从目标文本中推断。
+        use_random=False,
+        verbose=True
+    )
+
+    # 6. IndexTTS-2仍然支持一代的拼音功能，支持精确标注发音，例如：
+    text = "之前你做DE5很好，所以这一次也DEI3做DE2很好才XING2，如果这次目标完成得不错的话，我们就直接打DI1去银行取钱。"
+    """
 

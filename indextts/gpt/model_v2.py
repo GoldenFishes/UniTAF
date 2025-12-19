@@ -807,6 +807,7 @@ class UnifiedVoice(nn.Module):
         fake_inputs[:, -1] = self.start_mel_token
         return fake_inputs, batched_mel_emb, attention_mask
 
+    # FIXME:在这里UniTAFIndexTTS2和IndexTTS2生成结果不一样，故而在此处打印排查
     def inference_speech(self, speech_condition, text_inputs, emo_speech_condition=None, cond_lengths=None, emo_cond_lengths=None, emo_vec=None, use_speed=False, input_tokens=None, num_return_sequences=1,
                          max_generate_length=None, typical_sampling=False, typical_mass=.9, **hf_generate_kwargs):
         """
@@ -827,6 +828,21 @@ class UnifiedVoice(nn.Module):
             typical_mass: 典型采样的质量参数
             hf_generate_kwargs: 传递给GPT2生成模型的参数
         """
+
+        # # ===== 打印开始 =====
+        # import inspect, pprint
+        # frame = inspect.currentframe()
+        # args, _, _, values = inspect.getargvalues(frame)
+        #
+        # print("【inference_speech】调用参数一览")
+        # for arg in args:
+        #     if arg == "self":
+        #         continue
+        #     print(f"  {arg:<25} = {values[arg]}")
+        # # 单独把 **hf_generate_kwargs 打出来
+        # print("  hf_generate_kwargs        =", end=" ")
+        # pprint.pprint(hf_generate_kwargs, width=120)
+        # # ===== 打印结束 =====
 
         if speech_condition.ndim == 2:  # 处理单样本情况，添加批次维度
             speech_condition = speech_condition.unsqueeze(0)
@@ -859,6 +875,14 @@ class UnifiedVoice(nn.Module):
         conds_latent = torch.cat((speech_conditioning_latent + emo_vec.unsqueeze(1), duration_emb_half.unsqueeze(1), duration_emb.unsqueeze(1)), 1)
         # 准备GPT模型的输入
         input_ids, inputs_embeds, attention_mask = self.prepare_gpt_inputs(conds_latent, text_inputs)
+
+        # # 如果想看具体数值，把下面几行放开即可（只打前 5 列，防止刷屏）
+        # if input_ids.numel() > 0:
+        #     print("input_ids[0, :5]      =", input_ids[0, :5].tolist())
+        # if inputs_embeds.numel() > 0:
+        #     print("inputs_embeds[0, :5, 0:3] (前 3 维)=", inputs_embeds[0, :5, 0:3].tolist())
+        # if attention_mask.numel() > 0:
+        #     print("attention_mask[0, :5] =", attention_mask[0, :5].tolist())
 
         # 存储mel嵌入到推理模型中
         self.inference_model.store_mel_emb(inputs_embeds)
@@ -917,12 +941,22 @@ class UnifiedVoice(nn.Module):
             )
         else:
             # 使用标准推理模型生成
-            output = self.inference_model.generate(inputs, 
+            output = self.inference_model.generate(inputs,
                                                 bos_token_id=self.start_mel_token, pad_token_id=self.stop_mel_token,
                                                 eos_token_id=self.stop_mel_token, attention_mask=attention_mask,
                                                 max_length=max_length, logits_processor=logits_processor,
                                                 num_return_sequences=num_return_sequences,
                                                 **hf_generate_kwargs)
+
+            # 4. 打印输出
+            print("\n【generate 输出】")
+            print(f"output shape : {output.shape}")  # [B*num_return, seq]
+            print(f"output dtype : {output.dtype}")
+            print(f"output device: {output.device}")
+            if output.numel():
+                print("output", output)  # 只看第一条序列前 30 个 token
+
+
         # 处理输出结果，移除条件部分
         if isinstance(output, torch.Tensor):
             return output[:, trunc_index:], speech_conditioning_latent  # 返回生成的mel token和语音条件
