@@ -483,6 +483,7 @@ def print_model_arch(obj, name="model", indent=0):
 if __name__ == '__main__':
     """
     测试联合模型的流程 python unitaf_train/UniTAF.py
+    加载模型权重后可以打印查看结构等，请逐步解注释后续打印的方法。
     """
     # 将测试限制在固定卡上
     os.environ["CUDA_VISIBLE_DEVICES"] = "3"
@@ -606,7 +607,7 @@ if __name__ == '__main__':
             output_dir="outputs",
             save_name="inference_output",
             verbose=False,
-            render=False,
+            render=True,
         )
 
 

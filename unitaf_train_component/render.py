@@ -161,6 +161,7 @@ def render_meshes(mesh_vertices: torch.Tensor,
         rendered_imgs = rendered_imgs.permute(0, 2, 3, 1)  # NCHW -> NHWC
     return rendered_imgs
 
+# FIXME：这里实现失败，存在bug，后面还是安装pytorch3d以直接使用render_meshes而非render_meshes_np
 def render_meshes_np(mesh_vertices: torch.Tensor,
                      faces: torch.Tensor,
                      img_size: tuple = (256, 256),
@@ -367,6 +368,8 @@ def array_to_video(
     fps=30,
     resolution=None,   # 可强制指定输出分辨率
     disable_log: bool = False,
+    codec: str = "libx264",          # 指定编码器
+    pixel_format: str = "yuv420p"    # 兼容性最好的像素格式
 ) -> None:
     """
     把 [帧数, 高, 宽, 3] 的 uint8 数组直接写成 H.264 mp4
@@ -414,7 +417,8 @@ def array_to_video(
         '-loglevel', 'error',       # 只打印错误
         '-threads', '4',            # 并行编码
         '-i', '-',                  # 从 stdin 读帧 / The input comes from a pipe
-        '-vcodec', 'libx264',       # 视频编码器
+        '-vcodec', codec,           # 视频编码器
+        '-pix_fmt', pixel_format,   # 像素格式
         '-an',                      # 无音频 / Tells FFMPEG not to expect any audio
         output_path,
     ]
@@ -561,8 +565,8 @@ def render_npz_video(out_np: np.ndarray,          # [T, V, 3] 顶点序列
     # ---- 4. 渲染 ----
     img_size = (1024, 1024) if save_images else (512, 512)
     with torch.no_grad():
-        # 这里尝试用非pytorch3d的render_meshes实现
-        img_array = render_meshes_np(verts, faces, img_size)  # [T, H, W, 4] float 0-1
+        # 一般这里使用pytorch3d的render_meshes实现，如果pytorch3d无法安装，则尝试使用render_meshes_np
+        img_array = render_meshes(verts, faces, img_size)  # [T, H, W, 4] float 0-1
         channels = 4 if save_images else 3
         img_array = (img_array[..., :channels].cpu().numpy() * 255).astype(np.uint8)
 
@@ -605,13 +609,15 @@ if __name__ == '__main__':
     '''
     # vis_model_out_proxy()  # 当脚本被直接运行时，执行 vis_model_out_proxy
 
-    # TODO: 单独渲染的测试
-    # out_np =
-    # render_npz_video(
-    #     out_np=out_np,
-    #     audio_path="outputs/inference_output.wav",  # 原始 wav 完整路径；None=无声
-    #     out_dir="outputs",  # 想把视频/图片保存文件夹
-    #     annot_type="qxsk_inhouse_blendshape_weight",  # 你当时传给 get_vertices 的同一字符串
-    #     save_images=False,  # False=直接出 mp4；True=出逐帧 png
-    #     device="cuda"  # 或 "cpu"
-    # )
+    # 单独渲染的测试
+    npz_path = "outputs/inference_output.npz"
+    loaded = np.load(npz_path, allow_pickle=True)   # 字典
+    out_np = loaded['arr_0']                         # 键名默认 arr_0
+    render_npz_video(
+        out_np=out_np,
+        audio_path="outputs/inference_output.wav",  # 原始 wav 完整路径；None=无声
+        out_dir="outputs",  # 想把视频/图片保存文件夹
+        annot_type="qxsk_inhouse_blendshape_weight",  # 你当时传给 get_vertices 的同一字符串
+        save_images=False,  # False=直接出 mp4；True=出逐帧 png
+        device="cuda"  # 或 "cpu"
+    )
