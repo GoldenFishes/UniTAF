@@ -470,13 +470,13 @@ class UniTAFIndexTTS2(IndexTTS2):
             print(*segments, sep="\n")
 
         # 生成参数设置 ------------------------------------------------
-        do_sample = generation_kwargs.pop("do_sample", True)
-        top_p = generation_kwargs.pop("top_p", 0.8)
-        top_k = generation_kwargs.pop("top_k", 30)
-        temperature = generation_kwargs.pop("temperature", 0.8)
+        do_sample = generation_kwargs.pop("do_sample", True)                # True
+        top_p = generation_kwargs.pop("top_p", 0.8)                         # 0.8
+        top_k = generation_kwargs.pop("top_k", 30)                          # 30
+        temperature = generation_kwargs.pop("temperature", 0.8)             # 0.8
         autoregressive_batch_size = 1
         length_penalty = generation_kwargs.pop("length_penalty", 0.0)
-        num_beams = generation_kwargs.pop("num_beams", 3)
+        num_beams = generation_kwargs.pop("num_beams", 3)                   # 3 贪心解码
         repetition_penalty = generation_kwargs.pop("repetition_penalty", 10.0)
         max_mel_tokens = generation_kwargs.pop("max_mel_tokens", 1500)
         sampling_rate = 22050
@@ -548,7 +548,7 @@ class UniTAFIndexTTS2(IndexTTS2):
                         **generation_kwargs
                     )
 
-                    # print(f"GPT生成codes, codes:{codes[:5]}, speech_conditioning_latent:{speech_conditioning_latent[:5]}")
+                    # print(f"GPT生成codes, codes:{codes[:30]}, speech_conditioning_latent:{speech_conditioning_latent[:30]}")
 
                 gpt_gen_time += time.perf_counter() - m_start_time
 
@@ -606,6 +606,7 @@ class UniTAFIndexTTS2(IndexTTS2):
                         use_speed=use_speed,
                     )
                     gpt_forward_time += time.perf_counter() - m_start_time
+                    # print(f"gpt前向生成latent：{latent}")
 
                 # s2mel推理阶段 ------------------------------------------------
                 dtype = None
@@ -615,6 +616,7 @@ class UniTAFIndexTTS2(IndexTTS2):
                     inference_cfg_rate = 0.7
                     # print(f"--UnifiedVoice.forward()输出： {latent.shape}")  # torch.Size([1, 304, 1280])
                     latent = self.s2mel.models['gpt_layer'](latent)  # GPT层处理
+                    # print(f"--s2mel.models['gpt_layer']输出： {latent}")
                     audio_feature = latent
                     audio_features.append(audio_feature)  # 我们将这里的特征作为后续a2f的输入
 
@@ -638,15 +640,18 @@ class UniTAFIndexTTS2(IndexTTS2):
                                                                        cond.device),
                                                                    ref_mel, style, None, diffusion_steps,
                                                                    inference_cfg_rate=inference_cfg_rate)
-                    # print(f"vc_target: {vc_target.shape}")  # [1, 80, 670]
+                    # print(f"vc_target: {vc_target}")  # [1, 80, 670]
                     vc_target = vc_target[:, :, ref_mel.size(-1):]  # 裁剪目标梅尔谱图
-                    # print(f"vc_target: {vc_target.shape}")  # [1, 80, 522]
+                    # print(f"vc_target: {vc_target}")  # [1, 80, 522]
+
+                    # vc_target = torch.load('temp/vc_target_cache.pt', map_location='cuda:0')  # vc_target
+                    # print('【排查TTS生成噪声-Debug】vc_target 加载自 temp/vc_target_cache.pt')
+
                     s2mel_time += time.perf_counter() - m_start_time
 
                     # 声码器阶段
                     m_start_time = time.perf_counter()
                     wav = self.bigvgan(vc_target.float()).squeeze().unsqueeze(0)  # 梅尔谱图转波形
-                    print(wav.shape)
                     bigvgan_time += time.perf_counter() - m_start_time
                     wav = wav.squeeze(1)
 
@@ -658,7 +663,7 @@ class UniTAFIndexTTS2(IndexTTS2):
                 # wavs.append(wav[:, :-512])
                 wavs.append(wav.cpu())  # 转移到CPU并保存 / to cpu before saving
                 if stream_return:
-                    yield sampling_rate, wav.cpu(), audio_feature  # 流式返回当前段
+                    yield sampling_rate, wav.cpu(), audio_feature  # 流式返回当前段 Fixme:流式情况下未验证
                     if silence == None:
                         silence = self.interval_silence(wavs, sampling_rate=sampling_rate,
                                                         interval_silence=interval_silence)
@@ -670,6 +675,7 @@ class UniTAFIndexTTS2(IndexTTS2):
         self._set_gr_progress(0.9, "saving audio...")
         # 插入静音并合并所有音频段
         wavs = self.insert_interval_silence(wavs, sampling_rate=sampling_rate, interval_silence=interval_silence)
+        # print("wavs", wavs)
         wav = torch.cat(wavs, dim=1)  # 沿时间维度拼接
         wav_length = wav.shape[-1] / sampling_rate  # 计算音频时长
         # 合并所有音频特征段
@@ -774,6 +780,54 @@ def compare_modules(mod_a, mod_b, name_a='A', name_b='B', rtol=1e-5, atol=1e-8):
             print(f'[VALUE DIFF]  {k}  hash {name_a}:{ha} vs {name_b}:{hb}')
             diff += 1
     return diff
+
+@torch.no_grad()
+def compare_cfm_branch(model_a, model_b, name_a='UniTAF', name_b='IndexTTS2'):
+    """
+    仅比对 model.s2mel.models['cfm'] 分支
+    """
+    # 1. 收集所有 nn.Module
+    mods_a = collect_nn_modules(model_a)
+    mods_b = collect_nn_modules(model_b)
+
+    # 2. 只保留路径中带 s2mel.models.cfm 的模块
+    def filter_cfm(d):
+        return {k: v for k, v in d.items()
+                if 's2mel.models.cfm' in k}
+
+    cfm_a = filter_cfm(mods_a)
+    cfm_b = filter_cfm(mods_b)
+
+    # 3. 统一 key（去掉前缀差异）
+    def norm(k):
+        k = re.sub(r'^(unitaf_)?(indextts2\.)?', '', k, flags=re.I)
+        return k
+
+    keys_a = {norm(k): k for k in cfm_a}
+    keys_b = {norm(k): k for k in cfm_b}
+
+    common = sorted(set(keys_a) & set(keys_b))
+    only_a = set(keys_a) - set(keys_b)
+    only_b = set(keys_b) - set(keys_a)
+
+    if only_a or only_b:
+        print('>>> 仅存在于 {} 的 cfm 模块：{}'.format(name_a, list(only_a)))
+        print('>>> 仅存在于 {} 的 cfm 模块：{}'.format(name_b, list(only_b)))
+
+    total_diff = 0
+    for k in common:
+        ka, kb = keys_a[k], keys_b[k]
+        diff = compare_modules(cfm_a[ka], cfm_b[kb],
+                               name_a=f'{name_a}.{k}',
+                               name_b=f'{name_b}.{k}')
+        total_diff += diff
+        if diff > 0:
+            print(f'----- cfm 子模块 {k} 存在 {diff} 处权重差异 -----')
+        else:
+            print(f'----- cfm 子模块 {k} 权重完全一致 -----')
+
+    print(f'\n>>> cfm 分支总计发现 {total_diff} 处权重差异')
+    return total_diff
 
 def deep_compare(container_a, container_b, name_a='UniTAF', name_b='IndexTTS2', verbose_same=False):
     """
@@ -908,6 +962,10 @@ def compare_tts_pairs():
     deep_compare(unitaf_tts_model, tts_model,
                  name_a='UniTAFIndexTTS2', name_b='IndexTTS2')
 
+    # 比对 模型中 cfm 分支
+    compare_cfm_branch(unitaf_tts_model, tts_model,
+                       name_a='UniTAFIndexTTS2', name_b='IndexTTS2')
+
     # print_gpt_weights(tts_model)
 
     unitaf_sk = skeleton(unitaf_tts_model, 'UniTAFIndexTTS2')
@@ -924,42 +982,43 @@ if __name__ == "__main__":
     '''
     单独测试UniTAFIndexTTS2的音频推理 python -m unitaf_train_component.indextts2_inference_component
     '''
-    # 比较我们实现的UniTAFIndexTTS2和IndexTTS2在权重和结构上是否有区别
-    compare_tts_pairs()
+    os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+    # # 比较我们实现的UniTAFIndexTTS2和IndexTTS2在权重和结构上是否有区别
+    # compare_tts_pairs()
 
-    # from omegaconf import OmegaConf
-    # indextts2_cfg = OmegaConf.load("checkpoints/config.yaml")  # 加载IndexTTS2配置
-    #
-    # unitaf_tts_model = UniTAFIndexTTS2(
-    #     cfg=indextts2_cfg,
-    #     gpt_ckpt=None,  # 如果需要单独指定gpt_ckpt路径
-    #     model_dir="checkpoints",
-    #     use_cuda_kernel=False,  # 禁用CUDA内核
-    #     use_torch_compile=True  # 启用torch.compile优化
-    # )
-    #
-    # # 实际调用
-    # text = "清晨的阳光透过窗帘洒在书桌上，新的一天开始了。窗外鸟儿欢快地歌唱，空气中弥漫着淡淡的花香。"
-    # sr, wav, audio_feature = unitaf_tts_model.infer(
-    #     spk_audio_prompt='examples/voice_zhongli.wav',
-    #     text=text,
-    #     emo_alpha=0.6,
-    #     use_emo_text=True,
-    #     emo_text=text,  # 情感控制选择从传入的情感文本中推断，不传额外用于推断的情感文本时则直接从目标文本中推断。
-    #     verbose=False
-    # )
-    #
-    # tts_output_path = "outputs/UniTAF_output.wav"
-    #
-    # # 直接保存音频到指定路径中
-    # if os.path.isfile(tts_output_path):
-    #     os.remove(tts_output_path)
-    #     print(">> remove old wav file:", tts_output_path)
-    # if os.path.dirname(tts_output_path) != "":
-    #     os.makedirs(os.path.dirname(tts_output_path), exist_ok=True)
-    #
-    # torchaudio.save(tts_output_path, wav, sr)  # 保存为16位PCM
-    # print(">> wav file saved to:", tts_output_path)
+    from omegaconf import OmegaConf
+    indextts2_cfg = OmegaConf.load("checkpoints/config.yaml")  # 加载IndexTTS2配置
+
+    unitaf_tts_model = UniTAFIndexTTS2(
+        cfg=indextts2_cfg,
+        gpt_ckpt=None,  # 如果需要单独指定gpt_ckpt路径
+        model_dir="checkpoints",
+        use_cuda_kernel=False,  # 禁用CUDA内核
+        use_torch_compile=True  # 启用torch.compile优化
+    )
+
+    # 实际调用
+    text = "清晨的阳光透过窗帘洒在书桌上，新的一天开始了。窗外鸟儿欢快地歌唱，空气中弥漫着淡淡的花香。"
+    sr, wav, audio_feature = unitaf_tts_model.infer(
+        spk_audio_prompt='examples/voice_zhongli.wav',
+        text=text,
+        emo_alpha=0.6,
+        use_emo_text=True,
+        emo_text=text,  # 情感控制选择从传入的情感文本中推断，不传额外用于推断的情感文本时则直接从目标文本中推断。
+        verbose=False
+    )
+
+    tts_output_path = "outputs/UniTAF_output.wav"
+
+    # 直接保存音频到指定路径中
+    if os.path.isfile(tts_output_path):
+        os.remove(tts_output_path)
+        print(">> remove old wav file:", tts_output_path)
+    if os.path.dirname(tts_output_path) != "":
+        os.makedirs(os.path.dirname(tts_output_path), exist_ok=True)
+
+    torchaudio.save(tts_output_path, wav, sr)  # 保存为16位PCM
+    print(">> wav file saved to:", tts_output_path)
 
 
 

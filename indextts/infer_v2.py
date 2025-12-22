@@ -682,7 +682,7 @@ class IndexTTS2:
                         **generation_kwargs
                     )
 
-                    # print(f"GPT生成codes, codes:{codes[:5]}, speech_conditioning_latent:{speech_conditioning_latent[:5]}")
+                    # print(f"GPT生成codes, codes:{codes[:30]}, speech_conditioning_latent:{speech_conditioning_latent[:30]}")
 
                 gpt_gen_time += time.perf_counter() - m_start_time
 
@@ -738,6 +738,7 @@ class IndexTTS2:
                         use_speed=use_speed,
                     )
                     gpt_forward_time += time.perf_counter() - m_start_time
+                    # print(f"gpt前向生成latent：{latent}")
 
                 # s2mel推理阶段
                 dtype = None
@@ -747,7 +748,7 @@ class IndexTTS2:
                     inference_cfg_rate = 0.7
                     # print(f"--UnifiedVoice.forward()输出： {latent.shape}")  # torch.Size([1, 304, 1280])
                     latent = self.s2mel.models['gpt_layer'](latent)  # GPT层处理
-                    # print(f"--s2mel.models['gpt_layer']输出： {latent.shape}")  # torch.Size([1, 304, 1024])
+                    # print(f"--s2mel.models['gpt_layer']输出： {latent}")  # torch.Size([1, 304, 1024])
                     S_infer = self.semantic_codec.quantizer.vq2emb(codes.unsqueeze(1))  # 编码转嵌入 torch.Size([1, 1024, 304])
                     S_infer = S_infer.transpose(1, 2)  # torch.Size([1, 304, 1024])
                     S_infer = S_infer + latent  # 融合潜在表示 torch.Size([1, 304, 1024])
@@ -766,15 +767,20 @@ class IndexTTS2:
                                                                        cond.device),
                                                                    ref_mel, style, None, diffusion_steps,
                                                                    inference_cfg_rate=inference_cfg_rate)
-                    # print(f"vc_target: {vc_target.shape}")  # [1, 80, 670]
+                    # print(f"vc_target: {vc_target}")  # [1, 80, 670]
                     vc_target = vc_target[:, :, ref_mel.size(-1):]  # 裁剪目标梅尔谱图
-                    # print(f"vc_target: {vc_target.shape}")  # [1, 80, 522]
+                    # print(f"vc_target: {vc_target}")  # [1, 80, 522]
+
+                    # torch.save(vc_target, 'temp/vc_target_cache.pt')
+                    # print('vc_target 已缓存到 temp/vc_target_cache.pt')
+                    # vc_target = torch.load('temp/vc_target_cache.pt', map_location='cuda:0')
+                    # print('【排查TTS生成噪声-Debug】vc_target 加载自 temp/vc_target_cache.pt')
+
                     s2mel_time += time.perf_counter() - m_start_time
 
                     # 声码器阶段
                     m_start_time = time.perf_counter()
                     wav = self.bigvgan(vc_target.float()).squeeze().unsqueeze(0)  # 梅尔谱图转波形
-                    print(wav.shape)
                     bigvgan_time += time.perf_counter() - m_start_time
                     wav = wav.squeeze(1)
 
@@ -796,6 +802,7 @@ class IndexTTS2:
         self._set_gr_progress(0.9, "saving audio...")
         # 插入静音并合并所有音频段
         wavs = self.insert_interval_silence(wavs, sampling_rate=sampling_rate, interval_silence=interval_silence)
+        # print("wavs", wavs)
         wav = torch.cat(wavs, dim=1)  # 沿时间维度拼接
         wav_length = wav.shape[-1] / sampling_rate  # 计算音频时长
 
@@ -1007,6 +1014,9 @@ if __name__ == "__main__":
     '''
     单独测试 python -m indextts.infer_v2
     '''
+    # 将测试限制在固定卡上
+    os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+
     tts_model = IndexTTS2(
         cfg_path="checkpoints/config.yaml",     # 配置文件路径
         model_dir="checkpoints",

@@ -195,7 +195,7 @@ class UniTextAudioFaceModel(nn.Module):
             if os.path.dirname(tts_output_path) != "":
                 os.makedirs(os.path.dirname(tts_output_path), exist_ok=True)
 
-            torchaudio.save(tts_output_path, wav, sr)  # 保存为16位PCM
+            torchaudio.save(tts_output_path, wav.type(torch.int16), sr)  # 保存为16位PCM
             print(">> wav file saved to:", tts_output_path)
 
 
@@ -528,9 +528,9 @@ if __name__ == '__main__':
         },
         # 仅在推理模式下指定的部分模块的微调权重
         "finetune_checkpoint": {
-            # "tts_model": "./unitaf_ckpt/lora_tts_and_a2f_25-12-17/checkpoint-20000/tts_model.pt",
-            "audio_feature_projector": "./unitaf_ckpt/lora_tts_and_a2f_25-12-17/checkpoint-59312/audio_feature_projector.pt",
-            "a2f_model": "./unitaf_ckpt/lora_tts_and_a2f_25-12-17/checkpoint-59312/a2f_model.pt",
+            # "tts_model": "./unitaf_ckpt/UniTAF-A2F(lr_1e-4)- LoRA-TTS(lr_5e-7_rank_128)/checkpoint-20000/tts_model.pt",
+            "audio_feature_projector": "./unitaf_ckpt/UniTAF-A2F(lr_1e-4)- LoRA-TTS(lr_5e-7_rank_128)/checkpoint-59312/audio_feature_projector.pt",
+            "a2f_model": "./unitaf_ckpt/UniTAF-A2F(lr_1e-4)- LoRA-TTS(lr_5e-7_rank_128)/checkpoint-59312/a2f_model.pt",
         }
     }
 
@@ -608,7 +608,7 @@ if __name__ == '__main__':
             use_emo_text=True,
             emo_text=text,  # 情感控制选择从传入的情感文本中推断，不传额外用于推断的情感文本时则直接从目标文本中推断。
             verbose=False,   # 音频生成过程是否打印
-            render=False,  #是否渲染表情
+            render=True,  #是否渲染表情
         )
 
 

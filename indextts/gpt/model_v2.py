@@ -807,7 +807,6 @@ class UnifiedVoice(nn.Module):
         fake_inputs[:, -1] = self.start_mel_token
         return fake_inputs, batched_mel_emb, attention_mask
 
-    # FIXME:在这里UniTAFIndexTTS2和IndexTTS2生成结果不一样，故而在此处打印排查
     def inference_speech(self, speech_condition, text_inputs, emo_speech_condition=None, cond_lengths=None, emo_cond_lengths=None, emo_vec=None, use_speed=False, input_tokens=None, num_return_sequences=1,
                          max_generate_length=None, typical_sampling=False, typical_mass=.9, **hf_generate_kwargs):
         """
@@ -828,7 +827,13 @@ class UnifiedVoice(nn.Module):
             typical_mass: 典型采样的质量参数
             hf_generate_kwargs: 传递给GPT2生成模型的参数
         """
-
+        # # ===== 临时取消随机性 =====
+        # hf_generate_kwargs['do_sample'] = False
+        # hf_generate_kwargs['temperature'] = 1.0
+        # hf_generate_kwargs['top_p'] = 1.0
+        # hf_generate_kwargs['top_k'] = 0
+        # hf_generate_kwargs['num_beams'] = 1
+        # # ========================
         # # ===== 打印开始 =====
         # import inspect, pprint
         # frame = inspect.currentframe()
@@ -948,13 +953,13 @@ class UnifiedVoice(nn.Module):
                                                 num_return_sequences=num_return_sequences,
                                                 **hf_generate_kwargs)
 
-            # 4. 打印输出
-            print("\n【generate 输出】")
-            print(f"output shape : {output.shape}")  # [B*num_return, seq]
-            print(f"output dtype : {output.dtype}")
-            print(f"output device: {output.device}")
-            if output.numel():
-                print("output", output)  # 只看第一条序列前 30 个 token
+            # # 打印输出
+            # print("\n【generate 输出】")
+            # print(f"output shape : {output.shape}")  # [B*num_return, seq]
+            # print(f"output dtype : {output.dtype}")
+            # print(f"output device: {output.device}")
+            # if output.numel():
+            #     print("output", output)
 
 
         # 处理输出结果，移除条件部分
