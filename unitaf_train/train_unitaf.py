@@ -170,7 +170,11 @@ class UniTAFTrainer(Trainer):
             )
         )
 
-    def compute_losses(self, batch):
+    def compute_losses(self, batch, eval_step=False):
+        '''
+        compute_losses会在training step和eval step中同时调用compute_losses，
+        当为eval_step时，应当将audio feature与 out motion传递出来
+        '''
         device = next(self.model.parameters()).device   # 真实设备 而非指定self.device, 因为实际运行时Trainer 会按 accelerate 策略重新分配设备
         loss = {}
         # 1. TTS部分计算出TTS核心输出
@@ -271,7 +275,6 @@ class UniTAFTrainer(Trainer):
             mel_loss = (mel_ce * mel_mask).sum() / mel_mask.sum().clamp_min(1)
 
             metrics = {}
-            # --- with torch.no_grad():  # FIXME:注释掉 with torch.no_grad(): 看是不是这里中断计算图导致a2f没有梯度
             mel_logits_flat = mel_logits.permute(0, 2, 1).reshape(-1, mel_logits.size(1))
             mel_targets_flat = mel_targets.reshape(-1)
             mel_mask_flat = mel_mask.reshape(-1)
@@ -297,7 +300,13 @@ class UniTAFTrainer(Trainer):
             # print("[compute loss] mel_latent after gpt_layer", mel_latent.shape)  # torch.Size([16, 479, 1024])
             # print('[DEBUG] after s2mel mel_latent.requires_grad:', mel_latent.requires_grad)
 
-        # 2. 获得TTS部分核心输出 处理audio feature
+        # 在验证步骤中，将后续生成音频波形的所需特征记录到loss字典中
+        if eval_step:
+            # TODO: 我们在验证中仅传出GT，暂不使用TTS预测的音频token来生成波形。如果要得到预测的波形则需要实例化额外的组件
+            loss["gt_waveform"] = batch["gt_waveform"]  # List
+
+
+            # 2. 获得TTS部分核心输出 处理audio feature
         if "IndexTTS2" in self.train_config["tts_model"] and "UniTalker" in self.train_config["a2f_model"]:
             '''
             1. 获取我们需要的audio_feature： torch.Size([B, L, 1024])
@@ -376,11 +385,18 @@ class UniTAFTrainer(Trainer):
             loss["a2f_rec_loss"] = rec_loss
             loss["a2f_pca_loss"] = pca_loss
 
+            # 在验证步骤中，将模型生成的out_motion和gt表情记录到loss字典里
+            if eval_step:
+                loss["out_motion"] = out_motion
+                loss["gt_motion"] = face_data
+
         return loss
 
     def collate_batch(self, batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
         '''合并成tensor时需要padding为等长序列'''
         output = {}
+        output["sample_id"] = [item["sample_id"] for item in batch]
+
         if "IndexTTS2" in self.train_config["tts_model"]:
             '''
             接收到batch
@@ -388,6 +404,8 @@ class UniTAFTrainer(Trainer):
                 文本token         text_ids,text_ids_len
                 GT音频token       audio_codes,audio_codes_len
                 情感控制向量        emotion_vector
+                
+                GT音频波形         gt_waveform   仅供在验证步骤中使用
             '''
             text_tensors = [item["text_ids"] for item in batch]
             code_tensors = [item["audio_codes"] for item in batch]    # 这就是GT音频的离散编码
@@ -412,6 +430,8 @@ class UniTAFTrainer(Trainer):
             output["audio_codes"] = code_padded  # (B, L)
             output["audio_codes_len"] = code_lengths  # (B)
             output["emotion_vector"] = emo_stacked  # (B, 1280)
+
+            output["gt_waveform"] = [item["gt_waveform"] for item in batch]  # 采样率均为24000
 
             # print(f"[collate_batch] tts_condition: {condition_stacked.shape} ")
             # print(f"[collate_batch] tts_condition_len: {cond_lengths.shape}")
@@ -696,12 +716,14 @@ class UniTAFTrainer(Trainer):
         if (self.state.global_step + 1) % self.args.logging_steps == 0:
             log_dict={}
             with torch.no_grad():
-                tts_norm = torch.norm(torch.stack(
-                    [p.grad.norm() for p in self.model.tts_model.parameters() if p.grad is not None]))
-                a2f_norm = torch.norm(torch.stack(
-                    [p.grad.norm() for p in self.model.a2f_model.parameters() if p.grad is not None]))
-            log_dict["grad_norm/tts"] = tts_norm.item()
-            log_dict["grad_norm/a2f"] = a2f_norm.item()
+                if self.train_config["train_tts"]:
+                    tts_norm = torch.norm(torch.stack(
+                        [p.grad.norm() for p in self.model.tts_model.parameters() if p.grad is not None]))
+                    log_dict["grad_norm/tts"] = tts_norm.item()
+                if self.train_config["train_a2f"]:
+                    a2f_norm = torch.norm(torch.stack(
+                        [p.grad.norm() for p in self.model.a2f_model.parameters() if p.grad is not None]))
+                    log_dict["grad_norm/a2f"] = a2f_norm.item()
             self.log(log_dict)
 
 
@@ -783,6 +805,8 @@ class UniTAFTrainer(Trainer):
         # meter_names = ["tts_loss", "a2f_loss", "total_loss"]  # 初始这三个指标，后根据返回的loss_dict扩容
         meters = defaultdict(AverageMeter)
 
+        has_saved_render = False  # 用与标记是否已经可视化过一个batch的样本
+
         # 2. 遍历验证集
         for batch in tqdm(eval_dataloader, desc=f"Eval bsz={self.args.eval_batch_size}"):
             '''
@@ -790,7 +814,7 @@ class UniTAFTrainer(Trainer):
             '''
             # 2.1 前向并获得loss
             with self.compute_loss_context_manager():
-                loss_dict = self.compute_losses(batch)
+                loss_dict = self.compute_losses(batch, eval_step=True)
 
             # 2.2 计算各自 loss
             tts_loss = torch.tensor(0., device=self.device)
@@ -819,6 +843,37 @@ class UniTAFTrainer(Trainer):
             meters["a2f_loss"].update(a2f_loss.item(), bsz)
             meters["total_loss"].update(total_loss.item(), bsz)
 
+            # 2.4 可视化渲染
+            if has_saved_render is not True:  # 用于控制在evaluate遍历中只渲染一个batch的样本
+                '''
+                我们已经在训练step中通过Loss字典传递出：
+                loss_dict["gt_waveform"]  gt 音频波形  List
+                loss_dict["gt_motion"]    gt 表情数据  tensor
+                loss_dict["out_motion"]   模型预测表情数据  tensor 
+                
+                遍历loss_dict["gt_waveform"]列表，对batch下每一个样本单独获取其 gt音频/gt表情/预测表情 三元组
+                '''
+                gt_waveform_list = batch["gt_waveform"]  # GT 音频 从batch中获得
+                batch_size = len(gt_waveform_list)
+
+                # 遍历每个样本
+                for i in range(batch_size):
+                    gt_waveform = gt_waveform_list[i]  # 音频波形
+                    gt_motion = loss_dict["gt_motion"][i]  # GT 表情  从loss_compute中获得
+                    out_motion = loss_dict["out_motion"][i]  # 预测表情  从loss_compute中获得
+                    sample_id = batch["sample_id"][i]  # 样本id   从batch中获得
+
+                    self._render_and_save(
+                        gt_waveform=gt_waveform,
+                        gt_motion=gt_motion,
+                        out_motion=out_motion,
+                        annot_type="qxsk_inhouse_blendshape_weight",  # TODO:这里根据实际annot_type传递
+                        output_video_path=Path(f"outputs/evaluate/step_{self.state.global_step}/{sample_id}_{i}.mp4")
+                    )
+
+                has_saved_render = True
+
+
         # 4. 加前缀 & 过滤
         metrics = {}
         for k, meter in meters.items():
@@ -828,6 +883,30 @@ class UniTAFTrainer(Trainer):
 
         self.log(metrics)
         return metrics
+
+    def _render_and_save(self, gt_waveform, gt_motion, out_motion, annot_type, output_video_path):
+        '''
+        传入单条样本的GT音频路径，GT表情数据和预测表情数据
+        "qxsk_inhouse_blendshape_weight"
+        '''
+        from unitaf_train_component.render import render_video_for_evaluate
+        # 获取表情的顶点数据
+        out_motion_vertics = self.model.a2f_model.loss_module.get_vertices(out_motion.cuda(),
+                                                            annot_type=annot_type)
+        gt_motion_vectics = self.model.a2f_model.loss_module.get_vertices(gt_motion.cuda(),
+                                                        annot_type=annot_type)
+
+        # 确保输出路径存在
+        output_video_path.parent.mkdir(parents=True, exist_ok=True)   # 递归建目录
+
+        render_video_for_evaluate(
+            gt_waveform=gt_waveform,
+            gt_motion=gt_motion_vectics,
+            out_motion=out_motion_vertics,
+            annot_type=annot_type,
+            output_video_path=output_video_path
+        )
+
 
     def _save_checkpoint(self, model, trial, metrics=None):
         '''
@@ -946,7 +1025,6 @@ def main(train_config):
     print("[UniTAFTrainer] 训练结束...")
 
 
-
 if __name__ == '__main__':
     '''
     python unitaf_train/train_unitaf.py 
@@ -1005,20 +1083,20 @@ if __name__ == '__main__':
         "output_dir": "./unitaf_ckpt",  # 断点 & 日志保存根目录
         "resume_path": None,  # 如需断点续训，填 ckpt 路径或 True
         # 分别训练tts和a2f的配置
-        "train_tts": True,
+        "train_tts": False,
         "train_tts_lora": True,
         "train_a2f": True,  # 只要训练a2f,则必须训练audio feature projector. 故不在额外增加投影层是否训练的参数判断了
         # 优化器设置，为不同模块设置不同优化器
         "tts_train_cfg": {
-            "lr": 1e-5,
+            "lr": 5e-7,
             "betas": (0.9, 0.999),
             "weight_decay": 0.01,
             "eps": 1e-08,
         },
         "tts_lora_cfg": {
-            "lora_target_modules": ["c_attn", "c_proj"],  # 只针对TTS中gpt
-            "lora_rank": 64,
-            "lora_alpha": 64,
+            "lora_target_modules": ["c_attn", "c_proj", "c_fc"],  # 只针对TTS中gpt,包括attn和mlp层
+            "lora_rank": 128,
+            "lora_alpha": 128,
             "lora_dropout": 0.0,
         },
         "a2f_train_cfg": {

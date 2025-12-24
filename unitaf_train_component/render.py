@@ -16,13 +16,15 @@ us at voca@tue.mpg.de
 更多信息见 http://voca.is.tue.mpg.de，疑问请联系 voca@tue.mpg.de
 版权 2019，Max-Planck-Gesellschaft zur Förderung der Wissenschaften e.V.
 """
-
+import io
 import cv2
 import numpy as np
 import os
 import sys
+from pathlib import Path
 import subprocess
 import torch
+import torchaudio
 from tqdm import tqdm
 from unitaf_train.unitaf_dataset_support_config import unitaf_dataset_support_config
 
@@ -600,6 +602,94 @@ def render_npz_video(out_np: np.ndarray,          # [T, V, 3] 顶点序列
     subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     os.remove(tmp_path)
     print(f">> 视频已生成：{final_path}")
+
+
+def render_video_for_evaluate(
+    gt_waveform,
+    gt_motion,              # [T, V, 3]
+    out_motion,             # [T, V, 3]
+    output_video_path,      # 输出 mp4 完整路径
+    annot_type,
+    device: str = "cuda",
+):
+    '''
+    并排可视化 GT vs Pred 顶点动画，带音频。
+    帧数不一致时自动对齐（补帧或截断）。
+    （这里表情传进来的时候就是为顶点数据的tensor，音频为波形）
+    全程 tensor 操作，无中间 numpy 落地；音频走内存 pipe。
+    '''
+    T1, V, _ = gt_motion.shape
+    T2, _, _ = out_motion.shape
+
+    # ---- 0. 帧数对齐 ----
+    if T2 < T1:  # 预测短了，末尾补最后一帧
+        pad = out_motion[-1:].repeat(T1 - T2, 1, 1)
+        out_motion = torch.cat([out_motion, pad], dim=0)
+    elif T2 > T1:  # 预测长了，直接截断
+        out_motion = out_motion[:T1]
+    T = T1
+
+
+    # ---- 1. 面片 ----
+    faces = get_obj_faces(annot_type)  # [F, 3] numpy
+    faces = torch.from_numpy(faces[None]).to(device)  # [1, F, 3]
+
+    # ---- 2. 渲染 ----
+    H, W = 512, 512
+    bar_h = 80  # 顶部文字条高度
+    with torch.no_grad():
+        gt_img = render_meshes(gt_motion, faces, (H, W))[..., :3]       # [T, H, W, 3] float 0-1
+        pred_img = render_meshes(out_motion, faces, (H, W))[..., :3]    # [T, H, W, 3]
+
+    # ---- 3. 组装画面 ----
+    # 左右拼接
+    side = torch.cat([gt_img, pred_img], dim=2)  # [T,H,2W,3]
+    # 顶部文字条
+    bar = torch.ones((bar_h, 2 * W, 3), dtype=torch.uint8, device='cpu') * 255
+    bar = bar.numpy()
+    cv2.putText(bar, "Ground-Truth", (40, 50),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 255), 2)
+    cv2.putText(bar, "Prediction", (W + 40, 50),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 0, 0), 2)
+    bar = torch.from_numpy(bar).to(gt_img.device)  # 回到 GPU
+    bar = bar.unsqueeze(0).expand(T, -1, -1, -1)  # [T,bar_h,2W,3]
+    frames = torch.cat([bar, side], dim=1)  # [T,H+bar_h,2W,3]
+    frames = (frames * 255).clamp(0, 255).cpu().numpy().astype(np.uint8)
+
+    # ---- 4. 音频：tensor → 临时 wav 文件 ----
+    waveform = gt_waveform.cpu()  # [1, N]
+    out_dir = Path(output_video_path).parent  # 与 mp4 同目录
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    tmp_wav_path = out_dir / f"{Path(output_video_path).stem}_tmp.wav"
+    torchaudio.save(str(tmp_wav_path), waveform, sample_rate=24000)
+
+    # ---- 5. 先写无声视频 ----
+    tmp_mp4_path = str(out_dir / "tmp.mp4")
+    fps = 25  # 想保持与旧代码一致可再判 annot_type
+    array_to_video(frames, tmp_mp4_path, fps=fps)  # 你的旧函数
+
+    # ---- 6. 混音 ----
+    if Path(tmp_wav_path).exists():
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", tmp_mp4_path,
+            "-i", tmp_wav_path,
+            "-c:v", "copy",  # 视频不再重编
+            "-c:a", "aac",
+            "-shortest", output_video_path
+        ]
+    else:
+        # 意外无音频，直接拷贝
+        cmd = ["ffmpeg", "-y", "-i", tmp_mp4_path, "-c:v", "copy", output_video_path]
+
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # ---- 7. 清理临时文件 ----
+    os.remove(tmp_mp4_path)
+    os.remove(tmp_wav_path)
+    print(f">> 对比视频已生成：{output_video_path}")
+
+
 
 
 # 当脚本被直接运行时，执行 vis_model_out_proxy

@@ -344,6 +344,9 @@ class UniTAFDataset(Dataset):
             # 情感向量
             output["emotion_vector"] = torch.as_tensor(emo_vec, dtype=torch.float)  # torch.Size([1280])
 
+            # 我们这里收集GT wav以便在验证步骤eval step中重现GT
+            output["gt_waveform"] = gt_waveform
+
             # print(f"[prepare_model_input] tts_condition: {output['tts_condition'].shape}")
             # print(f"[prepare_model_input] tts_condition_len: {output['tts_condition_len'].shape}")
             # print(f"[prepare_model_input] text_ids: {output['text_ids'].shape}")
