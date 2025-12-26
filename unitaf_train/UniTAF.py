@@ -49,10 +49,11 @@ class UniTextAudioFaceModel(nn.Module):
                 self.tokenizer = TextTokenizer(str("checkpoints/bpe.model"), TextNormalizer())
                 indextts_cfg = OmegaConf.load(Path("checkpoints/config.yaml"))
                 # 初始化IndexTTS核心的UniVoice gpt model
+                ckpt_path = self.cfg.get("finetune_checkpoint", {}).get("tts_model") or "checkpoints/gpt.pth"
                 self.tts_model = self.build_indextts2_model(
                     cfg=indextts_cfg,
                     tokenizer=self.tokenizer,
-                    base_checkpoint="checkpoints/gpt.pth",
+                    base_checkpoint=ckpt_path,
                     device=device,
                 )
                 # 初始化IndexTTS的s2mel model
@@ -63,14 +64,24 @@ class UniTextAudioFaceModel(nn.Module):
 
             if "UniTalker" in cfg["a2f_model"]:
                 # 加载UniTalker Decoder并保存权重
+                ckpt = self.cfg.get("finetune_checkpoint", {}).get("a2f_model") or "a2f/pretrained_models/UniTalker-B-D0-D7.pt"
                 self.a2f_model = self.build_unitalker_decoder_model(
                     cfg=cfg,
-                    checkpoint=Path("a2f/pretrained_models/UniTalker-L-D0-D7.pt"),
+                    checkpoint=Path(ckpt),
                     device=device,
                 )
                 # 如果同时存在UniTalker和IndexTTS2,则初始化中间特征的投影层
                 if "IndexTTS2" in cfg["tts_model"]:
-                    self.audio_feature_projector = self.build_audio_feature_projector(in_dim=1024, out_dim=1024)
+                    self.audio_feature_projector = self.build_audio_feature_projector(self.cfg)
+
+                # 如果训练a2f时，只训练adapter部分（a2f.audio_feature_projector）
+                if cfg["train_a2f_adapter_only"]:
+                    import torchaudio
+                    # 用于将为IndexTTS准备的24k采样音频重采样为16k，作为UniTalker Encoder输入
+                    self.resample = torchaudio.transforms.Resample(orig_freq=24_000, new_freq=16_000).to(device)  # 放到跟模型同一设备
+
+                    # 此时我们需要约束projector输出特征与unitalker_encoder输出特征相同
+                    self.unitalker_encoder = self.build_unitalker_encoder_model(device=device)
 
         # 推理模式下
         if mode == 'inference':
@@ -82,7 +93,7 @@ class UniTextAudioFaceModel(nn.Module):
 
             if "UniTalker" in cfg["a2f_model"]:
                 # 尝试获取配置文件中a2f微调权重,如果没有,则载入预训练的权重
-                ckpt = self.cfg.get("finetune_checkpoint", {}).get("a2f_model") or "a2f/pretrained_models/UniTalker-L-D0-D7.pt"
+                ckpt = self.cfg.get("finetune_checkpoint", {}).get("a2f_model") or "a2f/pretrained_models/UniTalker-B-D0-D7.pt"
                 # 加载UniTalker Decoder并保存权重
                 self.a2f_model = self.build_unitalker_decoder_model(
                     cfg=cfg,
@@ -113,7 +124,7 @@ class UniTextAudioFaceModel(nn.Module):
                 self.a2f_loss_module = UniTalkerLoss(OmegaConf.load("a2f/config/unitalker.yaml")["LOSS"]).cuda()
                 # 如果同时存在UniTalker和IndexTTS2,则初始化中间特征的投影层
                 if "IndexTTS2" in cfg["tts_model"]:
-                    self.audio_feature_projector = self.build_audio_feature_projector(in_dim=1024, out_dim=1024)
+                    self.audio_feature_projector = self.build_audio_feature_projector(self.cfg)
                     self.audio_feature_projector.eval().cuda()
 
     def indextts2_unitalker_inference(
@@ -381,6 +392,15 @@ class UniTextAudioFaceModel(nn.Module):
         s2mel = s2mel.to(device)
         return s2mel.eval()
 
+    def build_unitalker_encoder_model(self, device):
+        '''
+        这里实例化UniTalker Decoder模型并加载权重
+        '''
+        from a2f.models.wavlm import WavLMModel
+        model = WavLMModel.from_pretrained('microsoft/wavlm-base-plus')
+        model.feature_extractor._freeze_parameters()  # 冻结UniTalker音频特征提取器
+        return model.to(device)
+
     def build_unitalker_decoder_model(self, cfg, checkpoint, device):
         '''
         这里实例化UniTalker Decoder模型并加载权重
@@ -393,9 +413,13 @@ class UniTextAudioFaceModel(nn.Module):
         cfg["UniTalker"]["identity_num"] = len(
             checkpoint['decoder.learnable_style_emb.weight'])  # 根据权重内容更新identity_num
         if not cfg["UniTalker"]["audio_encoder_feature_dim"]:
-            # 向配置中追加 audio_encoder_feature_dim
-            cfg["UniTalker"]["audio_encoder_feature_dim"] = 1024  # 设置默认为1024 来自IndexTTS.s2mel.models['gpt_layer']的维度
-            # 实际中这里最好在外部提前判断
+            # 向配置中追加 audio_encoder_feature_dim , 实际中这里最好在外部提前判断
+            cfg["UniTalker"]["audio_encoder_feature_dim"] = 768  # 设置默认为768 与官方原始权重UniTalker-L-D0-D7.pt保持一致。注：UniTalker-B-D0-D7.pt 则为768
+
+        # print("decoder.audio_feature_map.weight shape:",
+        #       checkpoint['decoder.audio_feature_map.weight'].shape)   # torch.Size([256, 768])
+        # print('[build_unitalker_decoder] cfg["UniTalker"]["audio_encoder_feature_dim"] =',
+        #       cfg["UniTalker"]["audio_encoder_feature_dim"])  # 768
 
         # 实例化UniTalkerDecoder
         model = UniTalkerDecoder(cfg)
@@ -403,25 +427,34 @@ class UniTextAudioFaceModel(nn.Module):
 
         return model.to(device)
 
-    def build_audio_feature_projector(self, in_dim=1024, out_dim=1024):
+    def build_audio_feature_projector(self, cfg):
         """
+        in_dim与tts输出音频特征维度相同
+        out_dim与a2f接收音频特征维度相同
         这里实例化用于将TTS的audio feature在时间长度和特征维度上与A2F Decoder对齐的投影层
         """
         from unitaf_train_component.audio_feature_projector import AudioFeatureProjector
+
+        if "IndexTTS2" in cfg["tts_model"]:
+            in_dim = 1024  # 与我们取IndexTTS2中 self.s2mel.models["gpt_layer"](mel_latent) 相同
+
+        if "UniTalker" in cfg["a2f_model"]:
+            out_dim = cfg["UniTalker"]["audio_encoder_feature_dim"]  # 与UniTalker Decoder接收维度相同， 由外部配置文件决定
+
         proj = AudioFeatureProjector(in_dim, out_dim)
 
-        ckpt_path = self.cfg.get("finetune_checkpoint", {}).get("audio_feature_projector")
+        ckpt_path = cfg.get("finetune_checkpoint", {}).get("audio_feature_projector")
         if ckpt_path: # 如果存在权重
             state_dict = torch.load(ckpt_path, map_location='cpu')
             proj.load_state_dict(state_dict)
         else:
-            # 随机初始化AudioFeatureProjector
-            with torch.no_grad():
-                # 卷积权重用 Kaiming 正态
-                nn.init.kaiming_normal_(proj.conv.weight, mode='fan_out', nonlinearity='relu')
-                # 偏置置零
-                nn.init.zeros_(proj.conv.bias)
-        return AudioFeatureProjector(in_dim, out_dim)
+            # 对所有 Conv1d 做 Kaiming
+            for m in proj.modules():
+                if isinstance(m, nn.Conv1d):
+                    nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                    # bias 已经是 False，无需处理
+        return proj
+
 
 
 # ---------- 一次性检查工具方法 ----------
@@ -518,7 +551,7 @@ if __name__ == '__main__':
             # A2F Loss计算时设置
             "pca_weight": 0.01,
             # 以下需要从外部获得并更新：
-            "audio_encoder_feature_dim": 1024,  # 假设是1024，根据不同的TTS模型的输出决定
+            "audio_encoder_feature_dim": 768,  # 原始UniTalker Decoder接收特征维度是768，我们需要经过projector使得音频特征输出相同维度
             "identity_num": 20,  # 假设是20，需要根据不同数据集决定
         },
         # 数据集类
@@ -526,11 +559,11 @@ if __name__ == '__main__':
             "dataset_root_path": "/home/zqg/project/data/UniTAF Dataset",
             "dataset_list": ["D12"]  # 这里测试也传数据集是用于指导模型选择何种输出头
         },
-        # 仅在推理模式下指定的部分模块的微调权重
+        # 加载指定的部分模块的微调权重。
         "finetune_checkpoint": {
             # "tts_model": "./unitaf_ckpt/UniTAF-A2F(lr_1e-4)- LoRA-TTS(lr_5e-7_rank_128)/checkpoint-20000/tts_model.pt",
-            "audio_feature_projector": "./unitaf_ckpt/UniTAF-A2F(lr_1e-4)- LoRA-TTS(lr_5e-7_rank_128)/checkpoint-59312/audio_feature_projector.pt",
-            "a2f_model": "./unitaf_ckpt/UniTAF-A2F(lr_1e-4)- LoRA-TTS(lr_5e-7_rank_128)/checkpoint-59312/a2f_model.pt",
+            "audio_feature_projector": "./unitaf_ckpt/UniTAF-A2F(lr_1e-4)- LoRA-TTS(lr_5e-7_rank_128)/checkpoint-20000/audio_feature_projector.pt",
+            "a2f_model": "./unitaf_ckpt/UniTAF-A2F(lr_1e-4)- LoRA-TTS(lr_5e-7_rank_128)/checkpoint-20000/a2f_model.pt",
         }
     }
 

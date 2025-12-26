@@ -351,11 +351,32 @@ class UniTAFTrainer(Trainer):
                 face_type 表情数据的格式
                 face_fps 表情帧率
             """
-
             face_data = batch["face_data"].to(device, non_blocking=True)
             face_type = batch["face_type"][0]
             identity = batch["speaker_idx"].to(device, non_blocking=True)
             face_template = batch["face_template"].to(device, non_blocking=True)
+
+            if self.train_config["train_a2f_adapter_only"]:
+                '''
+                这里获取self.model.unitalker_encoder的特征与audio_feature计算loss
+                '''
+                frame_num = face_data.shape[1]  # 直接使用真实面部运动数据的帧数
+
+                gt_waveform_list = batch["gt_waveform"]  # 获取GT波形的列表 这里列表中的每个音频都是24k hz采样的
+                gt_audio = self._batch_waveform_to_tensor(gt_waveform_list)  # 获得16k采样下的音频tensor
+                # 获得UniTalker Encoder输出的GT audio feature
+                unitalker_encoder_output = self.model.unitalker_encoder(
+                    gt_audio, frame_num=frame_num, interpolate_pos=train_config["UniTalker"]["interpolate_pos"])
+                # 返回的是 Wav2Vec2BaseModelOutput
+                gt_audio_feature = unitalker_encoder_output.last_hidden_state
+
+                # print(f"[Debug] gt_audio_feature.shape = {gt_audio_feature.shape}")  # torch.Size([2, 200, 768]
+                # print(f"[Debug] audio_feature.shape = {audio_feature.shape}")  # torch.Size([2, 200, 768]
+
+                # 计算Adapter Feature 与 UniTalker Feature之间的L2 loss
+                a2f_adapter_loss = F.mse_loss(audio_feature, gt_audio_feature, reduction='mean')
+
+                loss["a2f_adapter_loss"] = a2f_adapter_loss
 
             out_motion, out_pca, gt_pca = self.model.a2f_model(
                 audio_feature=audio_feature, template=face_template, face_motion=face_data,
@@ -568,7 +589,11 @@ class UniTAFTrainer(Trainer):
         # ---- A2F 与 投影层----
         if self.train_config["train_a2f"]:
             cfg = self.train_config["a2f_train_cfg"]
-            a2f_params = list(self.model.a2f_model.parameters())
+            # 如果只训练a2f adapter,则只包括a2f_model.audio_feature_map 和 audio_feature_projector
+            if self.train_config["train_a2f_adapter_only"] and "UniTalker" in self.train_config["a2f_model"]:
+                a2f_params = list(self.model.a2f_model.decoder.audio_feature_map.parameters())
+            else:
+                a2f_params = list(self.model.a2f_model.parameters())
             # 只要训练a2f模块，则必须训练audio_feature_projector
             if hasattr(self.model, 'audio_feature_projector'):
                 a2f_params.extend(self.model.audio_feature_projector.parameters())
@@ -583,11 +608,18 @@ class UniTAFTrainer(Trainer):
         # print(f"[DEBUG] - 传入optimizer的opt_list:{opt_list}")
         # for i, opt in enumerate(self.optimizer.optimizers):
         #     print(f"opt[{i}] 参数数:", sum(p.numel() for p in opt.param_groups[0]['params']))
-        '''
-        打印结果：
-        opt[0] 参数数: 865980639  /  opt[1] 参数数: 3323389  (a2f + projector 的参数量)   
-        可知tts与a2f(包含projector)均在参数内
-        '''
+
+        # ---------------- 调试打印 ----------------
+        from itertools import chain
+        for i, opt in enumerate(self.optimizer.optimizers):
+            params = list(chain.from_iterable(g['params'] for g in opt.param_groups))
+            # 根据你 append 的顺序，i==0 一定是 TTS，i==1 一定是 A2F
+            name = 'TTS' if i == 0 and self.train_config.get("train_tts") else \
+                'A2F' if self.train_config.get("train_a2f") else f'opt[{i}]'
+            print(f"[Optimizer] {name} 可优化参数数量: {sum(p.numel() for p in params):,}")
+            if self.train_config.get("debug_param_names", False):  # 想打名字就额外开开关
+                for p in params:
+                    print("   ", p.shape, p.name if hasattr(p, 'name') else "")
 
     def create_scheduler(self, num_training_steps: int, optimizer=None):
         """
@@ -643,8 +675,11 @@ class UniTAFTrainer(Trainer):
                             self.train_config["IndexTTS2"]["mel_loss_weight"] * loss_dict["tts_mel_loss"])
         if self.train_config["train_a2f"]:
             if "UniTalker" in self.train_config["a2f_model"]:
-                a2f_loss = (loss_dict["a2f_rec_loss"] +
-                            self.train_config["UniTalker"]["pca_weight"] * loss_dict["a2f_pca_loss"])
+                if self.train_config["train_a2f_adapter_only"]:  # 只训练Adapter时，更新a2f部分用a2f_adapter_loss，此时的a2f部分优化器中也只有Adapter部分参数
+                    a2f_loss = loss_dict["a2f_adapter_loss"]
+                else:
+                    a2f_loss = (loss_dict["a2f_rec_loss"] +
+                                self.train_config["UniTalker"]["pca_weight"] * loss_dict["a2f_pca_loss"])
         total_loss = tts_loss + a2f_loss
 
         # 3. 各自反向
@@ -716,13 +751,19 @@ class UniTAFTrainer(Trainer):
         if (self.state.global_step + 1) % self.args.logging_steps == 0:
             log_dict={}
             with torch.no_grad():
+                '''
+                用 unsqueeze(0) 把标量变成 1-D 张量，避免 stack 抱怨空列表；列表为空时返回 0.0 占位，日志里就能正常显示。
+                (在只训练adapter时，不更新a2f参数，不存在a2f梯度但是日志会仍然尝试记录)
+                '''
                 if self.train_config["train_tts"]:
-                    tts_norm = torch.norm(torch.stack(
-                        [p.grad.norm() for p in self.model.tts_model.parameters() if p.grad is not None]))
+                    grads = [p.grad.norm().unsqueeze(0) for p in self.model.tts_model.parameters()
+                             if p.grad is not None]
+                    tts_norm = torch.norm(torch.cat(grads)) if grads else torch.tensor(0.0, device=self.args.device)
                     log_dict["grad_norm/tts"] = tts_norm.item()
                 if self.train_config["train_a2f"]:
-                    a2f_norm = torch.norm(torch.stack(
-                        [p.grad.norm() for p in self.model.a2f_model.parameters() if p.grad is not None]))
+                    grads = [p.grad.norm().unsqueeze(0) for p in self.model.a2f_model.parameters()
+                             if p.grad is not None]
+                    a2f_norm = torch.norm(torch.cat(grads)) if grads else torch.tensor(0.0, device=self.args.device)
                     log_dict["grad_norm/a2f"] = a2f_norm.item()
             self.log(log_dict)
 
@@ -793,6 +834,11 @@ class UniTAFTrainer(Trainer):
     def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval"):
         """
         覆盖Trainer.evaluate，遍历一遍eval_dataset并收集评估指标（主要是各个部分的loss）
+
+        - 评估过程中对结果进行渲染可视化：
+            对每次评估集遍历的首个Batch中的样本，我们会渲染GT音频下GT表情与预测表情的对比视频，并保存于outputs/evaluate中
+            此时调用self.compute_losses时指定eval_step=True以保证GT音频与GT表情的顺利获取。
+
         """
         # 1. 准备模型和验证集
         eval_dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
@@ -886,8 +932,7 @@ class UniTAFTrainer(Trainer):
 
     def _render_and_save(self, gt_waveform, gt_motion, out_motion, annot_type, output_video_path):
         '''
-        传入单条样本的GT音频路径，GT表情数据和预测表情数据
-        "qxsk_inhouse_blendshape_weight"
+        传入单条样本的GT音频路径，GT表情数据和预测表情数据，调用渲染方法进行渲染并保存
         '''
         from unitaf_train_component.render import render_video_for_evaluate
         # 获取表情的顶点数据
@@ -953,6 +998,39 @@ class UniTAFTrainer(Trainer):
             super()._save_checkpoint(model, trial, metrics=metrics)
         else:
             super()._save_checkpoint(model, trial)
+
+    def _batch_waveform_to_tensor(self, wave_list, target_len=None):
+        """
+        专门为UniTalkerEncoder准备GT音频输入，
+        以获取其在UniTalker空间下的输出Feature用于约束UniTAF Adapter产生的Feature
+
+        wave_list: list[np.ndarray] 或 list[Tensor]，每个 shape (T,)
+        return: Tensor[B, L]  16 kHz，float32，已归一化到 [-1,1]
+        """
+        resampled = []
+        for w in wave_list:
+            if isinstance(w, np.ndarray):
+                w = torch.from_numpy(w).float()
+            w = w.to(self.device)
+            w = self.model.resample(w).squeeze(0)  # (T_16k,)
+            # print("w shape",w.shape)
+            resampled.append(w)
+
+        # 2. 统一长度
+        if target_len is None:  # 默认取最长
+            target_len = max(w.shape[0] for w in resampled)
+
+        padded = []
+        for w in resampled:
+            if w.shape[0] > target_len:
+                w = w[:target_len]
+            else:
+                w = torch.nn.functional.pad(w, (0, target_len - w.shape[0]))
+            padded.append(w)
+
+        audio = torch.stack(padded, dim=0)  # [B, L]
+        # print("audio shape", audio.shape)
+        return audio
 
 def setup_dataset(train_config):  # 支持多数据集训练，对应unitaf_dataset_support_config中具体数据集
     '''
@@ -1057,7 +1135,7 @@ if __name__ == '__main__':
             # A2F Loss计算时设置
             "pca_weight": 0.01,
             # 以下需要参数需要根据实际情况更新：
-            "audio_encoder_feature_dim": 1024,  # 由我们选择获取的TTS中间结果Audio Feature的dim决定
+            "audio_encoder_feature_dim": 768,  # 原始UniTalker-L-D0-D7.pt接收特征维度是1024，UniTalker-B-D0-D7.pt接收特征维度768。我们需要经过projector使得音频特征输出相同维度
             "identity_num": 20,  # 暂定为20，实际在UniTalker Decoder权重加载时会从权重中得到这里的值并更新
         },
         # 数据集类-------------------------------------------------------------------------------------------------------
@@ -1072,20 +1150,21 @@ if __name__ == '__main__':
         "device": "cuda:0",  # 注: 需要与外部的CUDA_VISIBLE_DEVICES一致!但只有一个可见卡时，硬编码则应该是cuda：0
         # 训练设置-------------------------------------------------------------------------------------------------------
         "batch_size": 2,
-        "epochs": 8,
+        "epochs": 10,
         "grad_accumulation": 1,
         "grad_clip": 1.0,
         "use_amp": True,
         "warmup_steps": 50, # 所有调度器统一参数 warmup 为50
         "log_interval": 20,  # training_step 里打印 loss 的步长         # 20
-        "val_interval": 1000,  # 每隔多少 step 做一次验证               # 1000
+        "val_interval": 2000,  # 每隔多少 step 做一次验证               # 2000
         "save_interval": 20000,  # 每隔多少 step 存一次 ckpt              # 20000
         "output_dir": "./unitaf_ckpt",  # 断点 & 日志保存根目录
         "resume_path": None,  # 如需断点续训，填 ckpt 路径或 True
         # 分别训练tts和a2f的配置
         "train_tts": False,
-        "train_tts_lora": True,
+        "train_tts_lora": True,  # 仅 train_tts 时有效
         "train_a2f": True,  # 只要训练a2f,则必须训练audio feature projector. 故不在额外增加投影层是否训练的参数判断了
+        "train_a2f_adapter_only": True,  # 训练a2f时，是否只训练adapter部分（a2f.audio_feature_projector）
         # 优化器设置，为不同模块设置不同优化器
         "tts_train_cfg": {
             "lr": 5e-7,
@@ -1107,6 +1186,12 @@ if __name__ == '__main__':
         },
         # 日志配置：
         "report_to": "wandb",
+        # 加载指定模块的自定义权重用于替代官方预训练权重：
+        "finetune_checkpoint": {
+            # "tts_model": "./unitaf_ckpt/UniTAF-A2F(lr_1e-4)- LoRA-TTS(lr_5e-7_rank_128)/checkpoint-20000/tts_model.pt",
+            # "audio_feature_projector": "./unitaf_ckpt/UniTAF-A2F-Adapter(lr_1e-4)/checkpoint-7414/audio_feature_projector.pt",
+            # "a2f_model": "./unitaf_ckpt/UniTAF-A2F-Adapter(lr_1e-4)/checkpoint-7414/a2f_model.pt",
+        }
     }
     train_config = OmegaConf.create(train_config)
 

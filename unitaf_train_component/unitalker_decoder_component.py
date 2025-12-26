@@ -224,7 +224,7 @@ if __name__ == '__main__':
             # A2F Loss计算时设置
             "pca_weight": 0.01,
             # 以下需要从外部获得并更新：
-            "audio_encoder_feature_dim": 1024,  # 假设是1024，根据不同的TTS模型的输出决定
+            "audio_encoder_feature_dim": 768,  # 原始UniTalker Decoder接收特征维度是768，我们需要经过projector使得音频特征输出相同维度
             "identity_num": 20,  # 假设是20，需要根据不同数据集决定
         },
         # 数据集类
