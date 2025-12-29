@@ -589,14 +589,17 @@ class UniTAFTrainer(Trainer):
         # ---- A2F 与 投影层----
         if self.train_config["train_a2f"]:
             cfg = self.train_config["a2f_train_cfg"]
-            # 如果只训练a2f adapter,则只包括a2f_model.audio_feature_map 和 audio_feature_projector
-            if self.train_config["train_a2f_adapter_only"] and "UniTalker" in self.train_config["a2f_model"]:
-                a2f_params = list(self.model.a2f_model.decoder.audio_feature_map.parameters())
+            # 如果只训练a2f adapter,则只包括audio_feature_projector
+            if self.train_config["train_a2f_adapter_only"]:
+                a2f_params = list(self.model.audio_feature_projector.parameters())
+            # 如果不训练a2f adapter,则只包括a2f_model
+            elif self.train_config["train_except_a2f_adapter"]:
+                a2f_params = list(self.model.a2f_model.parameters())
+            # 否则audio_feature_projector和a2f_model都参与训练
             else:
                 a2f_params = list(self.model.a2f_model.parameters())
-            # 只要训练a2f模块，则必须训练audio_feature_projector
-            if hasattr(self.model, 'audio_feature_projector'):
                 a2f_params.extend(self.model.audio_feature_projector.parameters())
+
             opt_list.append(AdamW(a2f_params,
                                   lr=cfg.get("lr", 2e-5),
                                   betas=cfg.get("betas", (0.9, 0.999)),
@@ -914,7 +917,8 @@ class UniTAFTrainer(Trainer):
                         gt_motion=gt_motion,
                         out_motion=out_motion,
                         annot_type="qxsk_inhouse_blendshape_weight",  # TODO:这里根据实际annot_type传递
-                        output_video_path=Path(f"outputs/evaluate/step_{self.state.global_step}/{sample_id}_{i}.mp4")
+                        # 保存于输出路径下 evaluate 文件夹中
+                        output_video_path=Path(f"{self.train_config['output_dir']}/evaluate/step_{self.state.global_step}/{sample_id}_{i}.mp4")
                     )
 
                 has_saved_render = True
@@ -1108,7 +1112,7 @@ if __name__ == '__main__':
     python unitaf_train/train_unitaf.py 
     '''
     # 设置使得Trainer限制在固定卡上
-    os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # 只用第 0 号卡，此时会从可见卡开始编码cuda:0,cuda:1...
+    os.environ["CUDA_VISIBLE_DEVICES"] = "1"  # 只用第 0 号卡，此时会从可见卡开始编码cuda:0,cuda:1...
 
     train_config = {
         # 模型类型，这里用于指导训练器类训练哪些模型
@@ -1158,13 +1162,14 @@ if __name__ == '__main__':
         "log_interval": 20,  # training_step 里打印 loss 的步长         # 20
         "val_interval": 2000,  # 每隔多少 step 做一次验证               # 2000
         "save_interval": 20000,  # 每隔多少 step 存一次 ckpt              # 20000
-        "output_dir": "./unitaf_ckpt",  # 断点 & 日志保存根目录
+        "output_dir": "./unitaf_ckpt/UniTAF-A2F(except adapter)-加载Adapter预训练权重(约束AudioFeature_step_74140)_251229",  # 断点 & 日志保存根目录
         "resume_path": None,  # 如需断点续训，填 ckpt 路径或 True
         # 分别训练tts和a2f的配置
         "train_tts": False,
         "train_tts_lora": True,  # 仅 train_tts 时有效
         "train_a2f": True,  # 只要训练a2f,则必须训练audio feature projector. 故不在额外增加投影层是否训练的参数判断了
-        "train_a2f_adapter_only": True,  # 训练a2f时，是否只训练adapter部分（a2f.audio_feature_projector）
+        "train_a2f_adapter_only": False,  # 训练a2f时，是否只训练adapter部分（a2f.audio_feature_projector）
+        "train_except_a2f_adapter": True,  # 训练a2f时，排除adapter部分（a2f.audio_feature_projector）
         # 优化器设置，为不同模块设置不同优化器
         "tts_train_cfg": {
             "lr": 5e-7,
@@ -1189,7 +1194,7 @@ if __name__ == '__main__':
         # 加载指定模块的自定义权重用于替代官方预训练权重：
         "finetune_checkpoint": {
             # "tts_model": "./unitaf_ckpt/UniTAF-A2F(lr_1e-4)- LoRA-TTS(lr_5e-7_rank_128)/checkpoint-20000/tts_model.pt",
-            # "audio_feature_projector": "./unitaf_ckpt/UniTAF-A2F-Adapter(lr_1e-4)/checkpoint-7414/audio_feature_projector.pt",
+            "audio_feature_projector": "./unitaf_ckpt/UniTAF-A2F-Adapter_Only(lr_1e-4)：计算audio feature的L2 loss/checkpoint-74140/audio_feature_projector.pt",
             # "a2f_model": "./unitaf_ckpt/UniTAF-A2F-Adapter(lr_1e-4)/checkpoint-7414/a2f_model.pt",
         }
     }
