@@ -304,14 +304,20 @@ class BlendShapeLoss_61(nn.Module):
         # TODO:增加 style_control
         loss_coeff = self.mse(x, target)  # 系数空间
         loss_vert = self.mse(self.bs2vertices(x), self.bs2vertices(target))  # 顶点空间 取前面51维
+        loss_mouth = self.mouth_openness_loss(x, target)  # 基于嘴巴状态的顶点空间加权loss
 
         # print('loss_coeff=', loss_coeff.item(),
-        #       'loss_vert=', loss_vert.item(),
-        #       'total=', (self.bs_beta * loss_coeff + loss_vert).item())
+        #       'loss_mouth=', loss_mouth.item(),
+        #       # 'loss_vert=', loss_vert.item(),
+        #       # 'total=', (self.bs_beta * loss_coeff + loss_vert).item()
+        #       )
+
+        # loss_coeff = 0.017819076776504517  loss_mouth = 8.6860518422327e-07
         # loss_coeff= 0.008641262538731098 loss_vert= 3.773815478780307e-06 total= 4.637941856344696e-06
 
-        # return self.bs_beta * loss_coeff + loss_vert  # FIXME：这里不采用顶点坐标的loss贡献
-        return loss_coeff  # 直接返回系数空间的mse loss
+        # return self.bs_beta * loss_coeff + loss_vert
+        # return loss_coeff  # 直接返回系数空间的mse loss
+        return loss_coeff + 0.01 * loss_mouth
 
     # ---------- 系数 -> 顶点 ----------
     def bs2vertices(self, x: torch.Tensor):
@@ -345,6 +351,101 @@ class BlendShapeLoss_61(nn.Module):
         metric_L2 = metric_L2.max(-1)[0]
         metric_L2norm = metric_L2 ** 0.5
         return metric_L2.mean(), metric_L2norm.mean()
+
+    def mouth_openness_loss(self, x, target):
+        '''
+        在语音驱动人脸（Audio2Face）任务中，普通的 MSE loss
+        容易使模型学到“半张半合”的安全嘴型。
+        为避免模型在嘴型预测上趋于模糊，本 loss 通过以下策略进行约束：
+
+        - 当 GT 嘴巴状态接近“完全闭合”或“最大张开”时： 若 Pred 与 GT 不一致，显著放大惩罚
+        - 当 GT 嘴巴处于“半开半合”区间时： 使用普通的 MSE 惩罚，不额外放大
+
+        1. 不直接在 61 维 blendshape 系数空间做约束
+        2. 而是从顶点空间中提取“嘴巴开合度（mouth openness）”这一语义标量
+        3. 根据 GT 嘴型的“极端程度”动态调整 loss 权重
+           极端嘴型犯错代价更高，模糊嘴型保持正常惩罚
+        4. 将得到的这个权重系数作用于顶点空间的loss
+
+        参数：
+        x / target : Tensor, shape (B, T, 61)
+            预测 / 真实的 blendshape 系数序列
+
+        返回：
+        loss : Tensor (scalar)
+            加权后的 mouth openness 损失
+        '''
+        # 仅使用前 components_num 维 blendshape 系数
+        # （后续的 blendshape 基仅定义在前 components_num 维）
+        x = x[..., :self.components_num]
+        target = target[..., :self.components_num]
+
+        # 将 blendshape 系数还原为 3D 顶点坐标
+        # v_pred / v_gt: (B, T, V, 3)
+        v_pred = self.bs2vertices(x).reshape(*x.shape[:-1], -1, 3)
+        v_gt = self.bs2vertices(target).reshape(*x.shape[:-1], -1, 3)
+
+        # GT 的嘴巴开合度（语义标量）
+        # norm_openness*: (B, T)
+        _, norm_openness = self.compute_mouth_openness_batch(v_gt)
+
+        '''
+        极端嘴型加权顶点空间损失函数
+        
+        norm_openness: (B, T)，在任意B下时刻T中 norm_openness的值
+        - ≈ 0.0（接近闭嘴）或 ≈ 1.0（接近最大张开）：
+            → 权重增大，犯错代价更高
+        - ≈ 0.5（半开半合）：
+            → 权重接近 0，减弱顶点空间loss的作用
+
+        weight = 0 + alpha * |open_gt_n - 0.5|^gamma
+
+        其中：
+        - alpha 控制放大强度
+        - gamma 控制权重曲线的陡峭程度
+        
+        最终在GT上计算得到的每个时刻T下的 weight 会作用于每个时刻T时的 v_pred与v_gt 顶点Loss的加权。
+        
+        '''
+        alpha = 3.0
+        gamma = 2.0
+        weight = 0.0 + alpha * torch.abs(norm_openness - 0.5) ** gamma
+
+        weight = weight.unsqueeze(-1).unsqueeze(-1)  # (B, T, 1, 1)
+        loss = weight * (v_gt - v_pred) ** 2
+
+        # 返回标量 loss
+        return loss.mean()
+
+    def compute_mouth_openness_batch(self, vertices, min_val=0.0320, max_val=0.0450):
+        """
+        批量 + 时间序列计算嘴巴开合度并归一化
+
+        参数：
+            vertices : 每个 batch、每帧的人脸 3D 顶点  (B, T, V, 3)
+            min_val : 被认为闭嘴的最小开合阈值 float
+            max_val : 被认为最大张开的开合阈值 float
+
+        返回：
+            openness : 每帧实际嘴巴开合距离（单位 same as vertices）  (B, T)
+            norm_openness : 每帧归一化开合度 [0,1], 0为闭口 1为大开口  (B, T)
+        """
+        # 选出口部顶点，shape: (B, T, M, 3)
+        mouth_vertices = vertices[:, :, self.mouth_idx, :]
+
+        # 取竖直方向坐标 (y 轴)，shape: (B, T, M)
+        y_coords = mouth_vertices[..., 1]
+
+        # 计算上下嘴唇差值
+        openness = y_coords.max(dim=-1)[0] - y_coords.min(dim=-1)[0]  # shape: (B, T)
+
+        # 特殊归一化
+        norm_openness = (openness - min_val) / (max_val - min_val)
+        norm_openness = torch.clamp(norm_openness, 0.0, 1.0)
+
+        return openness, norm_openness
+
+
 
 
 class ParamLoss(nn.Module):

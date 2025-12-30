@@ -517,7 +517,7 @@ if __name__ == '__main__':
     加载模型权重后可以打印查看结构等，请逐步解注释后续打印的方法。
     """
     # 将测试限制在固定卡上
-    os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
     # 添加项目根目录到Python路径
     current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -562,8 +562,8 @@ if __name__ == '__main__':
         # 加载指定的部分模块的微调权重。
         "finetune_checkpoint": {
             # "tts_model": "./unitaf_ckpt/UniTAF-A2F(lr_1e-4)- LoRA-TTS(lr_5e-7_rank_128)/checkpoint-20000/tts_model.pt",
-            "audio_feature_projector": "./unitaf_ckpt/UniTAF-A2F(lr_1e-4)- LoRA-TTS(lr_5e-7_rank_128)/checkpoint-20000/audio_feature_projector.pt",
-            "a2f_model": "./unitaf_ckpt/UniTAF-A2F(lr_1e-4)- LoRA-TTS(lr_5e-7_rank_128)/checkpoint-20000/a2f_model.pt",
+            "audio_feature_projector": "./unitaf_ckpt/UniTAF-A2F(lr_1e-4)-加载Adapter预训练权重(Adatpre特征损失约束_step_74140)/checkpoint-74140/audio_feature_projector.pt",
+            "a2f_model": "./unitaf_ckpt/UniTAF-A2F(lr_1e-4)-加载Adapter预训练权重(Adatpre特征损失约束_step_74140)/checkpoint-74140/a2f_model.pt",
         }
     }
 
