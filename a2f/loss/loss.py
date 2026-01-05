@@ -306,18 +306,20 @@ class BlendShapeLoss_61(nn.Module):
         loss_vert = self.mse(self.bs2vertices(x), self.bs2vertices(target))  # 顶点空间 取前面51维
         loss_mouth = self.mouth_openness_loss(x, target)  # 基于嘴巴状态的顶点空间加权loss
 
+
         # print('loss_coeff=', loss_coeff.item(),
         #       'loss_mouth=', loss_mouth.item(),
-        #       # 'loss_vert=', loss_vert.item(),
+        #       'loss_vert=', loss_vert.item(),
         #       # 'total=', (self.bs_beta * loss_coeff + loss_vert).item()
         #       )
+        # loss_coeff= 2.8236519545316696e-02 loss_mouth= 9.476868285673845e-07 loss_vert= 9.994230822485406e-06
 
-        # loss_coeff = 0.017819076776504517  loss_mouth = 8.6860518422327e-07
-        # loss_coeff= 0.008641262538731098 loss_vert= 3.773815478780307e-06 total= 4.637941856344696e-06
 
-        # return self.bs_beta * loss_coeff + loss_vert
+        # return loss_coeff + 10000 * loss_vert  # 系数空间 + 顶点空间
         # return loss_coeff  # 直接返回系数空间的mse loss
-        return loss_coeff + 0.01 * loss_mouth
+        # return 10000 * loss_vert  # 直接返回顶点空间的mse loss
+        # return loss_coeff + 100000 * loss_mouth  # 系数空间 + 基于嘴巴状态的顶点空间加权loss
+        return 10000 * loss_mouth  # 基于嘴巴状态的顶点空间加权loss
 
     # ---------- 系数 -> 顶点 ----------
     def bs2vertices(self, x: torch.Tensor):
@@ -398,7 +400,7 @@ class BlendShapeLoss_61(nn.Module):
         - ≈ 0.5（半开半合）：
             → 权重接近 0，减弱顶点空间loss的作用
 
-        weight = 0 + alpha * |open_gt_n - 0.5|^gamma
+        weight = 0 + alpha * |norm_openness - 0.5|^gamma
 
         其中：
         - alpha 控制放大强度

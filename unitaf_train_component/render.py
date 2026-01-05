@@ -556,9 +556,18 @@ def render_npz_video(out_np: np.ndarray,          # [T, V, 3] 顶点序列
 
     # ---- 1. 准备目录 ----
     os.makedirs(out_dir, exist_ok=True)
+    # # 读音频长度
+    # if audio_path and Path(audio_path).exists():
+    #     info = torchaudio.info(audio_path)
+    #     print(f"Audio音频采样率：{info.sample_rate}")  # 22050
+    #     print(f"Audio音频总帧数：{info.num_frames}")  # 232448
+    #     print(f"Audio音频长度：{info.num_frames / info.sample_rate} 秒")  # 10.541859410430838 秒
 
     # ---- 2. 顶点转 Torch ----
     verts = torch.Tensor(out_np).to(device)          # [T, V, 3]
+    T = verts.shape[0]
+    # print(f"Face表情总帧数：{T}")  # 265
+    # print(f"Face表情在25fps下的时长：{T / 25}") # 10.6
 
     # ---- 3. 读面片 ----
     faces = get_obj_faces(annot_type)                # [F, 3] numpy
@@ -585,15 +594,19 @@ def render_npz_video(out_np: np.ndarray,          # [T, V, 3] 顶点序列
         return
 
     # ---- 7. 分支：mp4 视频 ----
+    '''
+    这里fps指定25，因为UniTAF训练中A2F部分以固定25fps训练
+    '''
     tmp_path = str(Path(out_dir) / "tmp.mp4")
-    fps = 25 if annot_type == "BIWI_23370_vertices" else 30
+    # fps = 25 if annot_type == "qxsk_inhouse_blendshape_weight" else 30
+    fps = 25
     array_to_video(img_array, tmp_path, fps=fps)
 
     final_path = str(Path(out_dir) / f"{out_key}_{annot_type}.mp4")
     if os.path.isfile(final_path):
         os.remove(final_path)
 
-    # 8. 混音 or 无声
+    # ---- 8. 混音 or 无声 ----
     if audio_path and Path(audio_path).exists():
         cmd = (f'ffmpeg -i {tmp_path} -i {audio_path} -c:v copy -c:a aac '
                f'-shortest -strict -2 {final_path} -y')
@@ -601,7 +614,7 @@ def render_npz_video(out_np: np.ndarray,          # [T, V, 3] 顶点序列
         cmd = f'ffmpeg -i {tmp_path} -c:v copy {final_path} -y'
     subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     os.remove(tmp_path)
-    print(f">> 视频已生成：{final_path}")
+    print(f">> 视频已生成：{final_path} ({T} 帧, 约 {T/fps:.2f} s)")
 
 
 def render_video_for_evaluate(
@@ -700,12 +713,12 @@ if __name__ == '__main__':
     # vis_model_out_proxy()  # 当脚本被直接运行时，执行 vis_model_out_proxy
 
     # 单独渲染的测试
-    npz_path = "outputs/inference_output.npz"
-    loaded = np.load(npz_path, allow_pickle=True)   # 字典
+    loaded = np.load("outputs/UniTAF_output.npz", allow_pickle=True)   # 字典
     out_np = loaded['arr_0']                         # 键名默认 arr_0
+    # print(f"Face表情的帧数：{len(out_np)}")
     render_npz_video(
         out_np=out_np,
-        audio_path="outputs/inference_output.wav",  # 原始 wav 完整路径；None=无声
+        audio_path="outputs/UniTAF_output.wav",  # 原始 wav 完整路径；None=无声
         out_dir="outputs",  # 想把视频/图片保存文件夹
         annot_type="qxsk_inhouse_blendshape_weight",  # 你当时传给 get_vertices 的同一字符串
         save_images=False,  # False=直接出 mp4；True=出逐帧 png
