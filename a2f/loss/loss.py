@@ -302,9 +302,12 @@ class BlendShapeLoss_61(nn.Module):
         return: 标量总损失
         """
         # TODO:增加 style_control
+        x_vertices = self.bs2vertices(x)
+        target_vertices = self.bs2vertices(target)
+
         loss_coeff = self.mse(x, target)  # 系数空间
-        loss_vert = self.mse(self.bs2vertices(x), self.bs2vertices(target))  # 顶点空间 取前面51维
-        loss_mouth = self.mouth_openness_loss(x, target)  # 基于嘴巴状态的顶点空间加权loss
+        loss_vert = self.mse(x_vertices, target_vertices)  # 顶点空间 取前面51维
+        loss_mouth = self.weighted_vertices_loss_by_mouth_openness(x_vertices, target_vertices)  # 基于嘴巴状态的顶点空间加权loss
 
 
         # print('loss_coeff=', loss_coeff.item(),
@@ -356,7 +359,7 @@ class BlendShapeLoss_61(nn.Module):
         metric_L2norm = metric_L2 ** 0.5
         return metric_L2.mean(), metric_L2norm.mean()
 
-    def mouth_openness_loss(self, x, target):
+    def weighted_vertices_loss_by_mouth_openness(self, x_vertices, target_vertices):
         '''
         在语音驱动人脸（Audio2Face）任务中，普通的 MSE loss
         容易使模型学到“半张半合”的安全嘴型。
@@ -372,22 +375,17 @@ class BlendShapeLoss_61(nn.Module):
         4. 将得到的这个权重系数作用于顶点空间的loss
 
         参数：
-        x / target : Tensor, shape (B, T, 61)
-            预测 / 真实的 blendshape 系数序列
+        x_vertices / target_vertices : Tensor, shape (B, T, V, 3)  已经转换好的顶点
+            预测 / 真实 的表情顶点序列
 
         返回：
         loss : Tensor (scalar)
-            加权后的 mouth openness 损失
+            加权后的 vertices 损失
         '''
-        # 仅使用前 components_num 维 blendshape 系数
-        # （后续的 blendshape 基仅定义在前 components_num 维）
-        x = x[..., :self.components_num]
-        target = target[..., :self.components_num]
-
-        # 将 blendshape 系数还原为 3D 顶点坐标
+        # 3D 顶点坐标
         # v_pred / v_gt: (B, T, V, 3)
-        v_pred = self.bs2vertices(x).reshape(*x.shape[:-1], -1, 3)
-        v_gt = self.bs2vertices(target).reshape(*x.shape[:-1], -1, 3)
+        v_pred = x_vertices.reshape(*x_vertices.shape[:-1], -1, 3)
+        v_gt = target_vertices.reshape(*target_vertices.shape[:-1], -1, 3)
 
         # GT 的嘴巴开合度（语义标量）
         # norm_openness*: (B, T)
