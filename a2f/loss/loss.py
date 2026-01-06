@@ -314,7 +314,9 @@ class BlendShapeLoss_61(nn.Module):
         #       )
         # loss_coeff= 2.8236519545316696e-02 loss_mouth= 9.476868285673845e-07 loss_vert= 9.994230822485406e-06
 
-
+        '''
+        请确保下面真正被执行的是你需要的Loss！！
+        '''
         # return loss_coeff + 10000 * loss_vert  # 系数空间 + 顶点空间
         # return loss_coeff  # 直接返回系数空间的mse loss
         # return 10000 * loss_vert  # 直接返回顶点空间的mse loss

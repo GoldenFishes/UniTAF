@@ -1,5 +1,6 @@
 '''
-该脚本用于实现评估模型情感控制的实验
+该脚本用于实现评估模型的实验
+- IndexTTSExperiment 主要用于评估TTS情感控制
 '''
 import os
 import sys
@@ -53,7 +54,6 @@ from tqdm import tqdm
 import shutil
 import itertools
 from indextts.infer_v2 import IndexTTS2
-from unitaf_train_component.indextts2_inference_component import UniTAFIndexTTS2
 
 class IndexTTSExperiment:
     def __init__(
