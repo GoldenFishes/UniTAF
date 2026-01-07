@@ -206,78 +206,78 @@ def render_from_sliders(*slider_values):
 
     return img.numpy(), mouth_openness, norm_openness  # gradio 接受 numpy
 
-# ==============================================================================================
-# WebUI实现
-device = "cuda" if torch.cuda.is_available() else "cpu"
 
-engine = ARkitBlendShapeWebUI()
-engine.mean_shape = engine.mean_shape.to(device)
-engine.blend_shape = engine.blend_shape.to(device)
+if __name__ == '__main__':
+    '''
+    项目根目录下运行：
+    python -m unitaf_train_component.render_webui
+    '''
+    # WebUI实现
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
-with gr.Blocks(title="ARKit BlendShape WebUI") as demo:
-    gr.HTML("""
-        <style>
-        #left-panel {
-            height: 90vh;
-            overflow-y: auto;
-            padding-right: 8px;
-        }
-        #right-panel {
-            height: 90vh;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-        }
-        </style>
-        """)
+    engine = ARkitBlendShapeWebUI()
+    engine.mean_shape = engine.mean_shape.to(device)
+    engine.blend_shape = engine.blend_shape.to(device)
 
-    with gr.Row():
-        # 左侧：可滚动 slider
-        with gr.Column(scale=1, elem_id="left-panel"):
-            sliders = []
-            for i in range(51):
-                sliders.append(
-                    gr.Slider(
-                        0.0, 1.0,
-                        step=0.01,
-                        value=0.0,
-                        label=unitalker_arkit_names[i],
+    with gr.Blocks(title="ARKit BlendShape WebUI") as demo:
+        gr.HTML("""
+            <style>
+            #left-panel {
+                height: 90vh;
+                overflow-y: auto;
+                padding-right: 8px;
+            }
+            #right-panel {
+                height: 90vh;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+            }
+            </style>
+            """)
+
+        with gr.Row():
+            # 左侧：可滚动 slider
+            with gr.Column(scale=1, elem_id="left-panel"):
+                sliders = []
+                for i in range(51):
+                    sliders.append(
+                        gr.Slider(
+                            0.0, 1.0,
+                            step=0.01,
+                            value=0.0,
+                            label=unitalker_arkit_names[i],
+                        )
                     )
+
+            # 右侧：始终可见渲染
+            with gr.Column(scale=1, elem_id="right-panel"):
+                img_out = gr.Image(
+                    label="Rendered Face",
+                    type="numpy",
+                    height=512
+                )
+                mouth_out = gr.Number(
+                    label="Mouth Openness",
+                    value=0.0,
+                    interactive=False  # 禁止交互，仅用于展示结果
+                )
+                norm_mouth_out = gr.Slider(
+                    label="Normalized Mouth Openness, 0为闭口, 1为大张口",
+                    minimum=0.0,
+                    maximum=1.0,
+                    step=0.01,
+                    value=0.0,
+                    interactive=False  # 禁止拖动，只用作显示进度
                 )
 
-        # 右侧：始终可见渲染
-        with gr.Column(scale=1, elem_id="right-panel"):
-            img_out = gr.Image(
-                label="Rendered Face",
-                type="numpy",
-                height=512
-            )
-            mouth_out = gr.Number(
-                label="Mouth Openness",
-                value=0.0,
-                interactive=False  # 禁止交互，仅用于展示结果
-            )
-            norm_mouth_out = gr.Slider(
-                label="Normalized Mouth Openness, 0为闭口, 1为大张口",
-                minimum=0.0,
-                maximum=1.0,
-                step=0.01,
-                value=0.0,
-                interactive=False  # 禁止拖动，只用作显示进度
+
+        # 任意 slider 变化 → 触发重新渲染
+        for s in sliders:
+            s.change(
+                fn=render_from_sliders,
+                inputs=sliders,
+                outputs=[img_out, mouth_out, norm_mouth_out],
             )
 
-
-    # 任意 slider 变化 → 触发重新渲染
-    for s in sliders:
-        s.change(
-            fn=render_from_sliders,
-            inputs=sliders,
-            outputs=[img_out, mouth_out, norm_mouth_out],
-        )
-
-demo.launch(server_name="0.0.0.0", server_port=7860, share=True)
-
-'''
-项目根目录下运行：
-python -m unitaf_train_component.render_webui
-'''
+    demo.launch(server_name="0.0.0.0", server_port=7860, share=True)

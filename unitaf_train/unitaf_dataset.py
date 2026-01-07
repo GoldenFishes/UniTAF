@@ -21,7 +21,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset
 
 # 导入unitaf项目支持的数据集字典
-from unitaf_dataset_support_config import unitaf_dataset_support_config
+from unitaf_train.unitaf_dataset_support_config import unitaf_dataset_support_config
 
 
 class UniTAFDataset(Dataset):
