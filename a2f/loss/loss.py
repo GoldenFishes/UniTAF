@@ -411,7 +411,7 @@ class BlendShapeLoss_61(nn.Module):
         '''
         alpha = 3.0
         gamma = 2.0
-        weight = 0.0 + alpha * torch.abs(norm_openness - 0.5) ** gamma
+        weight = 0.1 + alpha * torch.abs(norm_openness - 0.5) ** gamma
 
         weight = weight.unsqueeze(-1).unsqueeze(-1)  # (B, T, 1, 1)
         loss = weight * (v_gt - v_pred) ** 2
@@ -419,9 +419,15 @@ class BlendShapeLoss_61(nn.Module):
         # 返回标量 loss
         return loss.mean()
 
-    def compute_mouth_openness_batch(self, vertices, min_val=0.0320, max_val=0.0450):
+    # TODO: 请确保这里使用的Loss 归一化阈值是你想要的！ min_val 和 max_val
+    def compute_mouth_openness_batch(self, vertices, min_val=0.032137, max_val=0.041262):
         """
         批量 + 时间序列计算嘴巴开合度并归一化
+
+        这里min_val,max_val是根据数据集计算得到的，保证对loss贡献均衡条件下的结果，
+        由 unitaf_utils/check_dataset_mouth_openness.py
+        中 DatasetTester.find_balanced_range_weighted() 实现：
+            给定Loss加权计算公式下，求得使最终加权结果均衡的归一化区间。
 
         参数：
             vertices : 每个 batch、每帧的人脸 3D 顶点  (B, T, V, 3)
