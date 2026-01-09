@@ -307,7 +307,9 @@ class BlendShapeLoss_61(nn.Module):
 
         loss_coeff = self.mse(x, target)  # 系数空间
         loss_vert = self.mse(x_vertices, target_vertices)  # 顶点空间 取前面51维
-        loss_mouth = self.weighted_vertices_loss_by_mouth_openness(x_vertices, target_vertices)  # 基于嘴巴状态的顶点空间加权loss
+        loss_mouth = self.weighted_vertices_loss_by_mouth_openness(
+            x_vertices, target_vertices, apply_to="mouth"  # "all" | "mouth"
+        )  # 基于嘴巴状态的顶点空间加权loss, apply_to决定加权作用与全脸顶点还是进作用于嘴部顶点
 
 
         # print('loss_coeff=', loss_coeff.item(),
@@ -324,7 +326,7 @@ class BlendShapeLoss_61(nn.Module):
         # return loss_coeff  # 直接返回系数空间的mse loss
         # return 10000 * loss_vert  # 直接返回顶点空间的mse loss
         # return loss_coeff + 100000 * loss_mouth  # 系数空间 + 基于嘴巴状态的顶点空间加权loss
-        return 10000 * loss_mouth  # 基于嘴巴状态的顶点空间加权loss
+        return 10000 * loss_mouth  # 基于嘴巴状态的顶点空间加权loss (计算时参数apply_to决定加权范围是全脸还是单独口型)
 
     # ---------- 系数 -> 顶点 ----------
     def bs2vertices(self, x: torch.Tensor):
@@ -359,7 +361,12 @@ class BlendShapeLoss_61(nn.Module):
         metric_L2norm = metric_L2 ** 0.5
         return metric_L2.mean(), metric_L2norm.mean()
 
-    def weighted_vertices_loss_by_mouth_openness(self, x_vertices, target_vertices):
+    def weighted_vertices_loss_by_mouth_openness(
+        self,
+        x_vertices,
+        target_vertices,
+        apply_to: str = "all",  # "all" | "mouth"
+    ):
         '''
         在语音驱动人脸（Audio2Face）任务中，普通的 MSE loss
         容易使模型学到“半张半合”的安全嘴型。
@@ -372,7 +379,10 @@ class BlendShapeLoss_61(nn.Module):
         2. 而是从顶点空间中提取“嘴巴开合度（mouth openness）”这一语义标量
         3. 根据 GT 嘴型的“极端程度”动态调整 loss 权重
            极端嘴型犯错代价更高，模糊嘴型保持正常惩罚
-        4. 将得到的这个权重系数作用于顶点空间的loss
+        4. 将得到的这个权重系数作用于
+            apply_to:
+             - "all"   : 权重作用于全脸顶点（默认，兼容旧行为）
+             - "mouth" : 权重只作用于嘴部顶点，其余顶点使用普通 MSE
 
         参数：
         x_vertices / target_vertices : Tensor, shape (B, T, V, 3)  已经转换好的顶点
@@ -388,8 +398,7 @@ class BlendShapeLoss_61(nn.Module):
         v_gt = target_vertices.reshape(*target_vertices.shape[:-1], -1, 3)
 
         # GT 的嘴巴开合度（语义标量）
-        # norm_openness*: (B, T)
-        _, norm_openness = self.compute_mouth_openness_batch(v_gt)
+        _, norm_openness = self.compute_mouth_openness_batch(v_gt)  # norm_openness*: (B, T)
 
         '''
         极端嘴型加权顶点空间损失函数
@@ -409,12 +418,51 @@ class BlendShapeLoss_61(nn.Module):
         最终在GT上计算得到的每个时刻T下的 weight 会作用于每个时刻T时的 v_pred与v_gt 顶点Loss的加权。
         
         '''
+        # 计算权重
         alpha = 3.0
         gamma = 2.0
-        weight = 0.1 + alpha * torch.abs(norm_openness - 0.5) ** gamma
+        base_weight = 0.1
 
+        weight = base_weight + alpha * torch.abs(norm_openness - 0.5) ** gamma
         weight = weight.unsqueeze(-1).unsqueeze(-1)  # (B, T, 1, 1)
-        loss = weight * (v_gt - v_pred) ** 2
+
+        # 4. loss 计算（关键分支）
+        if apply_to == "all":
+            # ===== 权重作用于全脸 =====
+            loss = weight * (v_gt - v_pred) ** 2
+
+        elif apply_to == "mouth":
+            # ===== 权重只作用于嘴部 =====
+            # mouth_idx: List[int] or Tensor，嘴部顶点索引
+            mouth_idx = self.mouth_idx
+
+            # 嘴部顶点
+            v_gt_mouth = v_gt[:, :, mouth_idx, :]  # (B, T, M, 3)
+            v_pred_mouth = v_pred[:, :, mouth_idx, :]
+
+            # 非嘴部顶点
+            all_idx = torch.arange(v_gt.shape[2], device=v_gt.device)
+            non_mouth_idx = all_idx[~torch.isin(all_idx, torch.tensor(mouth_idx, device=v_gt.device))]
+
+            v_gt_other = v_gt[:, :, non_mouth_idx, :]
+            v_pred_other = v_pred[:, :, non_mouth_idx, :]
+
+            # mouth：加权
+            loss_mouth = weight * (v_gt_mouth - v_pred_mouth) ** 2
+
+            # non-mouth：普通 MSE
+            loss_other = (v_gt_other - v_pred_other) ** 2
+
+            loss = torch.cat(
+                [
+                    loss_mouth.reshape(loss_mouth.shape[0], loss_mouth.shape[1], -1),
+                    loss_other.reshape(loss_other.shape[0], loss_other.shape[1], -1),
+                ],
+                dim=-1,
+            )
+
+        else:
+            raise ValueError(f"Unknown apply_to mode: {apply_to}")
 
         # 返回标量 loss
         return loss.mean()

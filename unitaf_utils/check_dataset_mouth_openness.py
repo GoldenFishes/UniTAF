@@ -1,5 +1,34 @@
 '''
 用于遍历数据集验证开口程度的指标分布
+
+1. 计算嘴部开合度（mouth_openness）
+    遍历数据集中的所有样本,每个样本取后一个chunk（作为生成目标）。
+    逐帧计算嘴部开合度,加载面部ARKit混合形状参数
+    转换为3D顶点坐标并计算嘴部开合度量值
+
+2. 计算归一化开合度（norm_openness）
+    自动寻找最优归一化区间 [min_val, max_val]
+    采用加权平衡算法，确保归一化后的数据分布均衡
+    使用二分搜索优化归一化区间
+
+3. 计算损失函数权重
+    根据归一化开合度计算每个帧的权重系数
+    权重公式：weight = base_weight + alpha * |norm_openness - 0.5|^gamma
+    特性：
+        嘴部接近闭合或最大张开时权重增大;
+        嘴部半开时权重减小;
+        鼓励模型更关注极端开合状态
+
+4. 可视化分析
+    生成四个分布图：
+        mouth_openness_distribution.png: 原始开合度分布
+        norm_openness_distribution.png: 归一化开合度分布
+        weighting_factor_distribution.png: 权重系数分布
+        weighted_in_norm_distribution.png: 加权后的归一化开合度分布
+
+
+同时，我们使用加权平衡方法寻找最佳归一化区间（考虑数据分布的统计特征），实现于DatasetTester.find_balanced_range_weighted()
+
 '''
 
 
