@@ -20,7 +20,16 @@ from typing import Dict, List, Optional, Sequence, Set, Tuple, Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchgen.native_function_generation import self_to_out_signature
+from dataclasses import dataclass
+
+@dataclass
+class A2FStreamState:
+    '''
+    保存 A2F 流式推理的中间状态
+    '''
+    audio_feat_cache = None  # 尚未消费完的 audio feature
+    audio_samples_total: int = 0  # 累计对应的总音频采样点数
+    face_frames_generated: int = 0  # 已生成表情帧数
 
 
 class UniTextAudioFaceModel(nn.Module):
@@ -150,6 +159,7 @@ class UniTextAudioFaceModel(nn.Module):
     ):
         '''
         UniTAF联合模型的推理流程，接收所有原始IndexTTS2的参数
+        这里不支持真正的流式，是流式获取完整的indextts的audio, 之后再一次性推理出完整a2f。
         (默认IndexTTS2以24k HZ采样率，UniTalker Decoder设置为25fps)
 
         Args：
@@ -171,7 +181,7 @@ class UniTextAudioFaceModel(nn.Module):
             more_segment_before：默认为0 暂时不知道是什么意思
 
         以下是控制A2F部分的参数
-            rander：是否进行渲染
+            rander：是否进行渲染，无论是否流式，渲染都是最后再渲染
             **generation_kwargs： IndexTTS2.infer_generator中接收的其他参数，暂时不详
         '''
         import torchaudio
@@ -277,6 +287,180 @@ class UniTextAudioFaceModel(nn.Module):
                 save_images=False,  # False=直接出 mp4；True=出逐帧 png
                 device="cuda"  # 或 "cpu"
             )
+
+    def indextts2_unitalker_stream_inference(
+        self,
+        # TTS部分（IndexTTS2）所需参数
+        spk_audio_prompt,
+        text,
+        emo_audio_prompt=None,
+        emo_alpha=1.0,
+        emo_vector=None,
+        use_emo_text=False,
+        emo_text=None,
+        use_random=False,
+        interval_silence=200,
+        verbose=False,
+        max_text_tokens_per_segment=120,
+        more_segment_before=0,
+    ):
+        '''
+        UniTAF联合模型的推理流程，接收所有原始IndexTTS2的参数
+        (默认IndexTTS2以24k HZ采样率，UniTalker Decoder设置为25fps)
+
+        进行真正的流式推理
+        - TTS：增量 wav / audio_feature
+            每个chunk之间都穿插一个静音段
+        - A2F：按音频时间驱动逐步生成表情
+
+        流式返回：
+        yield dict:
+        {
+            "sr": int,
+            "wav": Tensor,
+            "audio_feature": Tensor,
+            "fps": float,
+            "motion": Tensor | None,
+            "vertices": np.ndarray | None
+        }
+        '''
+        print("================开始执行流式生成================")
+
+        # 必须是IndexTTS2与UniTalker Decoder的联合模型的推理模式
+        assert "IndexTTS2" in self.cfg["tts_model"]
+        assert "UniTalker" in self.cfg["a2f_model"]
+        assert self.mode == "inference"
+
+        a2f_state = A2FStreamState()
+        '''
+        audio_feat_cache   尚未消费完的 audio feature  (B, T_cache, D)
+        audio_samples_total   累计音频采样点数
+        face_frames_generated   已生成表情帧数
+        '''
+
+        # tts生成, 返回的是增量
+        for sr, wav_chunk, audio_feature in self.tts_model.infer(spk_audio_prompt, text, emo_audio_prompt, emo_alpha,emo_vector,
+                                              use_emo_text, emo_text, use_random, interval_silence,
+                                              verbose, max_text_tokens_per_segment, stream_return=True, more_segment_before=more_segment_before):
+
+            print("=" * 80)
+            print("[TTS STREAM STEP]")
+            print(f"sr = {sr}")
+
+            # --- 1. 音频增量 ---
+            audio_samples_chunk = wav_chunk.shape[-1]  # 增量音频chunk采样数
+            a2f_state.audio_samples_total += audio_samples_chunk  # 把增量音频采样数累积到 a2f流式状态中
+
+            print(f"audio_samples 增量 / 总量 = {audio_samples_chunk} / {a2f_state.audio_samples_total}")
+
+            # --- 2. audio_feature 增量 ---
+            if audio_feature is not None:
+                print(f"audio_feature 增量 = {tuple(audio_feature.shape)}")
+
+                # 缓存增量到 a2f_state
+                if a2f_state.audio_feat_cache is None:
+                    a2f_state.audio_feat_cache = audio_feature  # (B, T_chunk, D)
+                else:
+                    a2f_state.audio_feat_cache = torch.cat([a2f_state.audio_feat_cache, audio_feature], dim=1)
+            else:
+                print("audio_feature 增量 = None (skip)")
+
+            # --- 3. 调用 A2F 流式 step ---
+            motion_vertices, a2f_state = self._a2f_stream_step(
+                a2f_state,
+                audio_sr=sr,
+                face_fps=25
+            )  # 返回增量 motion_vertices [T, V, 3]
+
+            if motion_vertices is not None:
+                print(f"motion_vertices shape = {tuple(motion_vertices.shape)}")
+
+            # --- yield 流式结果 ---
+            yield {
+                "sr": sr,
+                "wav": wav_chunk,
+                "fps": 25,
+                "motion": motion_vertices,  # (B, T_new, V, 3) or None
+            }
+
+    def _a2f_stream_step(
+        self,
+        state: A2FStreamState,
+        audio_sr=16000,
+        face_fps=25
+    ):
+        """
+        根据累计音频时间，判断是否可以生成新的表情帧
+        返回:
+            motion_chunk: (B, T_new, motion_dim) | None
+            new_state
+        """
+        # 但没有audio feature的特征的时候不执行 a2f 推理
+        if state.audio_feat_cache is None:
+            print(f"[_a2f_stream_step] 无增量音频特征，不执行a2f")
+            return None, state
+
+        # 一帧表情对应的样本数
+        samples_per_face = audio_sr / face_fps  # e.g. 16000 / 25 = 640
+
+        # 计算本次能新增多少帧 new_frames
+        max_face_frames = int(state.audio_samples_total // samples_per_face)
+        new_frames = max_face_frames - state.face_frames_generated
+        if new_frames <= 0:
+            return None, state
+        print(f"[_a2f_stream_step] 允许的最大新帧数 = {new_frames}")
+
+        # a2f部分推理（audio feature projector + a2f）
+        out_vertices = self._a2f_generated(state.audio_feat_cache)  # 返回当前特征片段的表情顶点输出  [T, V, 3]
+        print(f"[_a2f_stream_step] 输出顶点形状 = {out_vertices.shape}")
+
+        # 实际新增帧数如果超过new_frames，则截断 out_vertices.size(1)
+        T_use = min(new_frames, out_vertices.size(0))
+        out_vertices = out_vertices[:T_use]
+
+        # TODO： 当前音频有静音段，但是表情没有静音段，流式生成中静音段部分均无表情，这会导致表情对不上？
+
+        # 更新state
+        state.face_frames_generated += out_vertices.size(0)
+        state.audio_feat_cache = None  # 当前特征已消费
+
+        return out_vertices, state
+
+    # 输入audio_feature,生成顶点
+    def _a2f_generated(self, audio_feature):
+        '''
+        接收audio_feature生成相应的表情
+        audio feature projector 处理特征
+        a2f部分生成表情输出，并返回顶点格式
+        '''
+
+        # 如果audio_feature L长度为单数，则在L维度（第二个维度）的末尾填充1个零向量
+        if audio_feature.size(1) % 2 == 1:  # 或者 if L % 2 == 1:
+            audio_feature = F.pad(audio_feature, (0, 0, 0, 1), mode='constant', value=0)  # (B, L+1, 1024)
+
+        audio_feature = self.audio_feature_projector(audio_feature)
+
+        B, T, _ = audio_feature.shape
+        face_template = torch.zeros(B, 61, device=audio_feature.device)  # 与"qxsk_inhouse_blendshape_weight"标注格式相同
+        identity = torch.full((B,), self.a2f_model.model_cfg["identity_num"] - 1,
+                              dtype=torch.long, device=audio_feature.device)
+
+        out_motion, _, _ = self.a2f_model(
+            audio_feature=audio_feature,
+            template=face_template,
+            face_motion=None,
+            style_idx=identity,
+            annot_type="qxsk_inhouse_blendshape_weight",
+            fps=25
+        )
+
+        # 获取到顶点数据
+        out_vertices = self.a2f_loss_module.get_vertices(out_motion.cuda(), annot_type="qxsk_inhouse_blendshape_weight")
+
+        return out_vertices  # [T, V, 3]
+
+
+
 
 
     def state_dict(self, *args, destination=None, prefix="", keep_vars=False):
@@ -562,8 +746,8 @@ if __name__ == '__main__':
         # 加载指定的部分模块的微调权重。
         "finetune_checkpoint": {
             # "tts_model": "./unitaf_ckpt/UniTAF-A2F(lr_1e-4)- LoRA-TTS(lr_5e-7_rank_128)/checkpoint-20000/tts_model.pt",
-            "audio_feature_projector": "./unitaf_ckpt/UniTAF-A2F(lr_1e-4)-加载Adapter预训练权重(Adatpre特征损失约束_step_74140)/checkpoint-74140/audio_feature_projector.pt",
-            "a2f_model": "./unitaf_ckpt/UniTAF-A2F(lr_1e-4)-加载Adapter预训练权重(Adatpre特征损失约束_step_74140)/checkpoint-74140/a2f_model.pt",
+            "audio_feature_projector": "./unitaf_ckpt/UniTAF-A2F(口型状态顶点空间加权loss_加权仅作用于嘴部顶点)-加载Adapter预训练权重(约束AudioFeature_step_74140)_260109/checkpoint-74140/audio_feature_projector.pt",
+            "a2f_model": "./unitaf_ckpt/UniTAF-A2F(口型状态顶点空间加权loss_加权仅作用于嘴部顶点)-加载Adapter预训练权重(约束AudioFeature_step_74140)_260109/checkpoint-74140/a2f_model.pt",
         }
     }
 
@@ -640,9 +824,10 @@ if __name__ == '__main__':
             emo_alpha=0.6,
             use_emo_text=True,
             emo_text=text,  # 情感控制选择从传入的情感文本中推断，不传额外用于推断的情感文本时则直接从目标文本中推断。
-            verbose=False,   # 音频生成过程是否打印
+            verbose=True,   # 音频生成过程是否打印
             render=True,  #是否渲染表情
         )
+
 
 
 

@@ -321,6 +321,7 @@ class BlendShapeLoss_61(nn.Module):
 
         '''
         请确保下面真正被执行的是你需要的Loss！！
+        （10000 是为了在多个loss中平衡数值级别）
         '''
         # return loss_coeff + 10000 * loss_vert  # 系数空间 + 顶点空间
         # return loss_coeff  # 直接返回系数空间的mse loss
@@ -365,7 +366,7 @@ class BlendShapeLoss_61(nn.Module):
         self,
         x_vertices,
         target_vertices,
-        apply_to: str = "all",  # "all" | "mouth"
+        apply_to: str = "mouth",  # "all" | "mouth"  实验证明 mouth 效果较好
     ):
         '''
         在语音驱动人脸（Audio2Face）任务中，普通的 MSE loss

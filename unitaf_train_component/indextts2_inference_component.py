@@ -322,7 +322,8 @@ class UniTAFIndexTTS2(IndexTTS2):
             if emo_text is None:
                 emo_text = text  # 使用主文本作为情感分析文本 / use main text prompt
             emo_dict = self.qwen_emo.inference(emo_text)  # 调用情感分析模型
-            print(f"从文本检测到的情感向量: {emo_dict}")
+            if verbose:
+                print(f"从文本检测到的情感向量: {emo_dict}")
             # / convert ordered dict to list of vectors; the order is VERY important!
             # 将有序字典转换为向量列表（顺序非常重要！）
             emo_vector = list(emo_dict.values())
@@ -337,7 +338,8 @@ class UniTAFIndexTTS2(IndexTTS2):
                 # / scale each vector and truncate to 4 decimals (for nicer printing)
                 # 缩放每个向量并截断到4位小数（为了更美观的打印）
                 emo_vector = [int(x * emo_vector_scale * 10000) / 10000 for x in emo_vector]
-                print(f"scaled emotion vectors to {emo_vector_scale}x: {emo_vector}")
+                if verbose:
+                    print(f"scaled emotion vectors to {emo_vector_scale}x: {emo_vector}")
 
         if emo_audio_prompt is None:
             # / we are not using any external "emotion reference voice"; use
@@ -683,14 +685,15 @@ class UniTAFIndexTTS2(IndexTTS2):
 
 
         # 打印性能统计
-        print(f"tts部分推理记录:")
-        print(f">> gpt_gen_time: {gpt_gen_time:.2f} seconds")
-        print(f">> gpt_forward_time: {gpt_forward_time:.2f} seconds")
-        print(f">> s2mel_time: {s2mel_time:.2f} seconds")
-        print(f">> bigvgan_time: {bigvgan_time:.2f} seconds")
-        print(f">> Total inference time: {end_time - start_time:.2f} seconds")
-        print(f">> Generated audio length: {wav_length:.2f} seconds")
-        print(f">> RTF: {(end_time - start_time) / wav_length:.4f}")
+        if verbose:
+            print(f"tts部分推理记录:")
+            print(f">> gpt_gen_time: {gpt_gen_time:.2f} seconds")
+            print(f">> gpt_forward_time: {gpt_forward_time:.2f} seconds")
+            print(f">> s2mel_time: {s2mel_time:.2f} seconds")
+            print(f">> bigvgan_time: {bigvgan_time:.2f} seconds")
+            print(f">> Total inference time: {end_time - start_time:.2f} seconds")
+            print(f">> Generated audio length: {wav_length:.2f} seconds")
+            print(f">> RTF: {(end_time - start_time) / wav_length:.4f}")
 
         # 保存音频 / save audio
         wav = wav.cpu()  # 确保在CPU上 / to cpu
