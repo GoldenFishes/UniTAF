@@ -299,7 +299,7 @@ class UniTextAudioFaceModel(nn.Module):
         use_emo_text=False,
         emo_text=None,
         use_random=False,
-        interval_silence=200,
+        interval_silence=0,  # 200 流式生成chunk之间的静音段间隔,
         verbose=False,
         max_text_tokens_per_segment=120,
         more_segment_before=0,
@@ -345,10 +345,15 @@ class UniTextAudioFaceModel(nn.Module):
 
             print("=" * 80)
             print("[TTS STREAM STEP]")
-            print(f"sr = {sr}")
+            # print(f"sr = {sr}") #  22050
 
             # --- 1. 音频增量 ---
-            audio_samples_chunk = wav_chunk.shape[-1]  # 增量音频chunk采样数
+            # TODO：当interval_silence=0时wav_chunk返回的是一个list，全量wav_chunk
+            if isinstance(wav_chunk, list):
+                # print(f"静音段：{wav_chunk}")
+                audio_samples_chunk=0
+            else:
+                audio_samples_chunk = wav_chunk.shape[-1]  # 增量音频chunk采样数
             a2f_state.audio_samples_total += audio_samples_chunk  # 把增量音频采样数累积到 a2f流式状态中
 
             print(f"audio_samples 增量 / 总量 = {audio_samples_chunk} / {a2f_state.audio_samples_total}")
@@ -397,7 +402,7 @@ class UniTextAudioFaceModel(nn.Module):
         """
         # 但没有audio feature的特征的时候不执行 a2f 推理
         if state.audio_feat_cache is None:
-            print(f"[_a2f_stream_step] 无增量音频特征，不执行a2f")
+            # print(f"[_a2f_stream_step] 无增量音频特征，不执行a2f")
             return None, state
 
         # 一帧表情对应的样本数

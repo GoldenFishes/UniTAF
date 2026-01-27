@@ -14,7 +14,9 @@ from indextts.utils.maskgct_utils import build_semantic_codec, build_semantic_mo
 class SemanticExtractor:
     def __init__(self, stats_path: Path, device: torch.device):
         self.device = device
-        self.feature_extractor = SeamlessM4TFeatureExtractor.from_pretrained("facebook/w2v-bert-2.0")
+        self.feature_extractor = SeamlessM4TFeatureExtractor.from_pretrained(
+            "facebook/w2v-bert-2.0"
+        )
         self.semantic_model, self.semantic_mean, self.semantic_std = build_semantic_model(
             path_=stats_path
         )

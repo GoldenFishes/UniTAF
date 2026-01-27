@@ -6,6 +6,10 @@ import torchaudio
 from unitaf_train.UniTAF import UniTextAudioFaceModel
 from unitaf_train_component.render import render_npz_video
 
+'''
+
+'''
+
 def test_unitaf_stream(unitaf):
     text = (f"清晨的邮差在山间迷了路。雾气像牛奶，淹没了所有熟悉的杉树与石阶。他推着那辆老旧的绿色自行车，在白色的混沌中，忽然看见一栋从未见过的小木屋，窗里透出温暖的、蜂蜜色的光。"
                 f"他敲了门。一位白发老妇人安静地出现，仿佛已等待多年。“请进，”她说，“有您一封信。”"
@@ -22,13 +26,21 @@ def test_unitaf_stream(unitaf):
             emo_alpha=0.6,
             use_emo_text=True,
             emo_text=text,  # 情感控制选择从传入的情感文本中推断，不传额外用于推断的情感文本时则直接从目标文本中推断。
+            interval_silence=0,  # 200 流式生成chunk之间的静音段间隔,
+            verbose=False,
+            max_text_tokens_per_segment=120,
+            more_segment_before=0,
         ):
         '''
         {"sr": sr, "wav": wav_chunk,
          "fps": 25, "motion": motion_vertices}  (T, V, 3) or None
         '''
         # 收集流式生成的音频和表情
-        wav_list.append(stream_output['wav'])
+        wav = stream_output["wav"]
+        if isinstance(wav, list):
+            wav_list.extend(wav)
+        else:
+            wav_list.append(wav)
         sampling_rate = stream_output['sr']
         if stream_output["motion"] is not None:
             motion_list.append(stream_output["motion"])
@@ -77,7 +89,7 @@ if __name__ == "__main__":
     测试联合模型的流式推理 python -m unitaf_utils.test_stream_UniTAF
     '''
     # 限制可见cuda
-    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+    os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
     current_dir = os.path.dirname(os.path.abspath(__file__))
     project_root = os.path.dirname(current_dir)

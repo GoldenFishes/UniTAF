@@ -135,7 +135,9 @@ class UniTAFIndexTTS2(IndexTTS2):
                 self.use_cuda_kernel = False
 
         # 初始化特征提取器
-        self.extract_features = SeamlessM4TFeatureExtractor.from_pretrained("facebook/w2v-bert-2.0")
+        self.extract_features = SeamlessM4TFeatureExtractor.from_pretrained(
+            "facebook/w2v-bert-2.0"
+        )
 
         # 构建语义模型
         self.semantic_model, self.semantic_mean, self.semantic_std = build_semantic_model(
@@ -665,42 +667,47 @@ class UniTAFIndexTTS2(IndexTTS2):
                 # wavs.append(wav[:, :-512])
                 wavs.append(wav.cpu())  # 转移到CPU并保存 / to cpu before saving
                 if stream_return:
-                    yield sampling_rate, wav.cpu(), audio_feature  # 流式返回当前段 Fixme:流式情况下未验证
-                    if silence == None:
-                        silence = self.interval_silence(wavs, sampling_rate=sampling_rate,
-                                                        interval_silence=interval_silence)
-                    yield sampling_rate, silence, None  # 返回静音段
+                    yield sampling_rate, wav.cpu(), audio_feature  # 流式返回当前段
+
+                    if interval_silence > 0:  # 当静音段为0时，不应该返回静音段
+                        if silence == None:
+                            silence = self.interval_silence(wavs, sampling_rate=sampling_rate,
+                                                            interval_silence=interval_silence)
+                        yield sampling_rate, silence, None  # 返回静音段
 
         # 合成结束 ------------------------------------------------
         end_time = time.perf_counter()
 
-        self._set_gr_progress(0.9, "saving audio...")
-        # 插入静音并合并所有音频段
-        wavs = self.insert_interval_silence(wavs, sampling_rate=sampling_rate, interval_silence=interval_silence)
-        # print("wavs", wavs)
-        wav = torch.cat(wavs, dim=1)  # 沿时间维度拼接
-        wav_length = wav.shape[-1] / sampling_rate  # 计算音频时长
-        # 合并所有音频特征段
-        audio_feature = torch.cat(audio_features, dim=1)
+        # 如果不是流式调用，则一次性返回全量，如果是流式调用，前面已经增量流式返回了，不在此处继续返回。
+        if not stream_return:
+
+            self._set_gr_progress(0.9, "saving audio...")
+            # 插入静音并合并所有音频段
+            wavs = self.insert_interval_silence(wavs, sampling_rate=sampling_rate, interval_silence=interval_silence)
+            # print("wavs", wavs)
+            wav = torch.cat(wavs, dim=1)  # 沿时间维度拼接
+            wav_length = wav.shape[-1] / sampling_rate  # 计算音频时长
+            # 合并所有音频特征段
+            audio_feature = torch.cat(audio_features, dim=1)
 
 
-        # 打印性能统计
-        if verbose:
-            print(f"tts部分推理记录:")
-            print(f">> gpt_gen_time: {gpt_gen_time:.2f} seconds")
-            print(f">> gpt_forward_time: {gpt_forward_time:.2f} seconds")
-            print(f">> s2mel_time: {s2mel_time:.2f} seconds")
-            print(f">> bigvgan_time: {bigvgan_time:.2f} seconds")
-            print(f">> Total inference time: {end_time - start_time:.2f} seconds")
-            print(f">> Generated audio length: {wav_length:.2f} seconds")
-            print(f">> RTF: {(end_time - start_time) / wav_length:.4f}")
+            # 打印性能统计
+            if verbose:
+                print(f"tts部分推理记录:")
+                print(f">> gpt_gen_time: {gpt_gen_time:.2f} seconds")
+                print(f">> gpt_forward_time: {gpt_forward_time:.2f} seconds")
+                print(f">> s2mel_time: {s2mel_time:.2f} seconds")
+                print(f">> bigvgan_time: {bigvgan_time:.2f} seconds")
+                print(f">> Total inference time: {end_time - start_time:.2f} seconds")
+                print(f">> Generated audio length: {wav_length:.2f} seconds")
+                print(f">> RTF: {(end_time - start_time) / wav_length:.4f}")
 
-        # 保存音频 / save audio
-        wav = wav.cpu()  # 确保在CPU上 / to cpu
-        # # 返回以符合Gradio的格式要求
-        # wav_data = wav.type(torch.int16)
-        # wav_data = wav_data.numpy().T  # 转置为(采样点数, 声道数)格式
-        yield sampling_rate, wav, audio_feature
+            # 保存音频 / save audio
+            wav = wav.cpu()  # 确保在CPU上 / to cpu
+            # # 返回以符合Gradio的格式要求
+            # wav_data = wav.type(torch.int16)
+            # wav_data = wav_data.numpy().T  # 转置为(采样点数, 声道数)格式
+            yield sampling_rate, wav, audio_feature
 
 
 def find_most_similar_cosine(query_vector, matrix):

@@ -120,7 +120,9 @@ class IndexTTS2:
                 self.use_cuda_kernel = False
 
         # 初始化特征提取器
-        self.extract_features = SeamlessM4TFeatureExtractor.from_pretrained("facebook/w2v-bert-2.0")
+        self.extract_features = SeamlessM4TFeatureExtractor.from_pretrained(
+            "facebook/w2v-bert-2.0"
+        )
 
         # 构建语义模型
         self.semantic_model, self.semantic_mean, self.semantic_std = build_semantic_model(
