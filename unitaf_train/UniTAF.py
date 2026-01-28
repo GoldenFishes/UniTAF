@@ -28,6 +28,7 @@ class A2FStreamState:
     保存 A2F 流式推理的中间状态
     '''
     audio_feat_cache = None  # 尚未消费完的 audio feature
+    last_face_motion = None  # 记录最后一帧表情, arkit格式 [1, 1, 61], 用于静音段的复制
     audio_samples_total: int = 0  # 累计对应的总音频采样点数
     face_frames_generated: int = 0  # 已生成表情帧数
 
@@ -45,6 +46,7 @@ class UniTextAudioFaceModel(nn.Module):
         '''
         self.cfg = cfg
         self.mode = mode
+        self.device = device
 
         # 训练模式下，一些组件在dataset中加载，主干加载需要训练的模块
         if mode == 'train':
@@ -347,13 +349,9 @@ class UniTextAudioFaceModel(nn.Module):
             print("[TTS STREAM STEP]")
             # print(f"sr = {sr}") #  22050
 
-            # --- 1. 音频增量 ---
-            # TODO：当interval_silence=0时wav_chunk返回的是一个list，全量wav_chunk
-            if isinstance(wav_chunk, list):
-                # print(f"静音段：{wav_chunk}")
-                audio_samples_chunk=0
-            else:
-                audio_samples_chunk = wav_chunk.shape[-1]  # 增量音频chunk采样数
+            assert isinstance(wav_chunk, torch.Tensor), f"在正常音频或静音段时，wav_chunk都应当为torch.Tensor, 然而目前却是{type(wav_chunk)}"
+            audio_samples_chunk = wav_chunk.shape[-1]  # 增量音频chunk采样数, 静音段和正常音频均会纳入统计并生成相应表情
+
             a2f_state.audio_samples_total += audio_samples_chunk  # 把增量音频采样数累积到 a2f流式状态中
 
             print(f"audio_samples 增量 / 总量 = {audio_samples_chunk} / {a2f_state.audio_samples_total}")
@@ -368,7 +366,7 @@ class UniTextAudioFaceModel(nn.Module):
                 else:
                     a2f_state.audio_feat_cache = torch.cat([a2f_state.audio_feat_cache, audio_feature], dim=1)
             else:
-                print("audio_feature 增量 = None (skip)")
+                print("audio_feature 增量 = None (施加与音频静音段相同的表情静音段)")
 
             # --- 3. 调用 A2F 流式 step ---
             motion_vertices, a2f_state = self._a2f_stream_step(
@@ -391,60 +389,92 @@ class UniTextAudioFaceModel(nn.Module):
     def _a2f_stream_step(
         self,
         state: A2FStreamState,
-        audio_sr=16000,
+        audio_sr=22050,
         face_fps=25
     ):
         """
         根据累计音频时间，判断是否可以生成新的表情帧
+
+        对于正常音频返回
+            audio_feat_cache   尚未消费完的 audio feature  (B, T_cache, D)
+            audio_samples_total   累计音频采样点数
+            face_frames_generated   已生成表情帧数
+
+        对于静音段返回
+
         返回:
             motion_chunk: (B, T_new, motion_dim) | None
             new_state
         """
-        # 但没有audio feature的特征的时候不执行 a2f 推理
-        if state.audio_feat_cache is None:
-            # print(f"[_a2f_stream_step] 无增量音频特征，不执行a2f")
-            return None, state
+        samples_per_face = audio_sr / face_fps  # 一帧表情对应的样本数 e.g. 16000 / 25 = 640
 
-        # 一帧表情对应的样本数
-        samples_per_face = audio_sr / face_fps  # e.g. 16000 / 25 = 640
-
-        # 计算本次能新增多少帧 new_frames
         max_face_frames = int(state.audio_samples_total // samples_per_face)
-        new_frames = max_face_frames - state.face_frames_generated
+        new_frames = max_face_frames - state.face_frames_generated  # 计算本次能新增多少帧
         if new_frames <= 0:
             return None, state
         print(f"[_a2f_stream_step] 允许的最大新帧数 = {new_frames}")
 
-        # a2f部分推理（audio feature projector + a2f）
-        out_vertices = self._a2f_generated(state.audio_feat_cache)  # 返回当前特征片段的表情顶点输出  [T, V, 3]
+
+        if state.audio_feat_cache is None:
+            # 静音段生成相同长度的静止表情
+            out_vertices, out_motion = self._a2f_generated_zero_face(state, num_frames=new_frames)
+            state.last_face_motion = out_motion[:, -1:]  # 保存最后一帧的表情顶点 [1, 1, 61]
+        else:
+            # a2f部分推理（audio feature projector + a2f）
+            out_vertices, out_motion = self._a2f_generated(state)  # 返回当前特征片段的表情顶点输出  [T, V, 3] 和 arkit输出 [1, T, 61]
+            state.last_face_motion = out_motion[:,-1:]  # 保存最后一帧的表情顶点 [1, 1, 61]
         print(f"[_a2f_stream_step] 输出顶点形状 = {out_vertices.shape}")
 
-        # 实际新增帧数如果超过new_frames，则截断 out_vertices.size(1)
+        # 实际新增帧数如果超过 new_frames，则截断 out_vertices.size(1)
         T_use = min(new_frames, out_vertices.size(0))
         out_vertices = out_vertices[:T_use]
 
-        # TODO： 当前音频有静音段，但是表情没有静音段，流式生成中静音段部分均无表情，这会导致表情对不上？
-
-        # 更新state
+        # 更新 state
         state.face_frames_generated += out_vertices.size(0)
         state.audio_feat_cache = None  # 当前特征已消费
 
         return out_vertices, state
 
     # 输入audio_feature,生成顶点
-    def _a2f_generated(self, audio_feature):
+    def _a2f_generated(self, state):
         '''
-        接收audio_feature生成相应的表情
-        audio feature projector 处理特征
-        a2f部分生成表情输出，并返回顶点格式
-        '''
+        接收audio_feature生成相应的表情，并返回顶点格式和ARKIT输出
 
+        1. 上一段静音段/音频段的最后一帧表情记作 last_face_motion。
+           - last_face_motion 的 shape 为 (1, 1, 61)，表示上一段的最后一帧 blendshape。
+           - 如果 last_face_motion 为 None，则说明当前段是序列的起始，直接从音频段第一帧开始生成。
+
+        2. 当前音频段的 audio_feature 先经过 audio_feature_projector 进行映射，生成适合 a2f 模型输入的特征。
+
+        3. 调用 a2f_model 将 audio_feature 映射为对应的表情动作 out_motion (B, T, 61)，
+           同时保持 batch 对齐。
+
+        4. 静音段到音频段平滑过渡：
+           - 对 out_motion 的前几帧（默认 transition_frames=3）进行插值处理。
+           - 插值公式：
+             frame_i = (1 - alpha_i) * last_face_motion + alpha_i * out_motion_i
+           - alpha_i 为线性增加因子，例如前3帧 alpha = [1/3, 2/3, 1]。
+           - 这样做的目的是让上一段静止/静音段的最后一帧表情自然过渡到音频段的第3帧，
+             避免突兀切换。
+
+        5. 对 out_motion 生成对应顶点 out_vertices：
+           - 调用 self.a2f_loss_module.get_vertices，将 blendshape 表情映射到顶点空间 [T, V, 3]。
+
+        返回值：
+            out_vertices: [T, V, 3] 顶点输出，用于渲染/动画
+            out_motion: [1, T, 61] ARKIT blendshape 输出，用于后续可能的静音段平滑或缓存
+        '''
+        # 1. 获取last_face_motion 和 未消费的audio_feature
+        last_face_motion = state.last_face_motion  # arkit (1, 1, 61)
+        audio_feature = state.audio_feat_cache
+
+        # 2. 确保audio_feature长度
         # 如果audio_feature L长度为单数，则在L维度（第二个维度）的末尾填充1个零向量
         if audio_feature.size(1) % 2 == 1:  # 或者 if L % 2 == 1:
             audio_feature = F.pad(audio_feature, (0, 0, 0, 1), mode='constant', value=0)  # (B, L+1, 1024)
-
         audio_feature = self.audio_feature_projector(audio_feature)
 
+        # 3. audio_feature -> arkit表情生成
         B, T, _ = audio_feature.shape
         face_template = torch.zeros(B, 61, device=audio_feature.device)  # 与"qxsk_inhouse_blendshape_weight"标注格式相同
         identity = torch.full((B,), self.a2f_model.model_cfg["identity_num"] - 1,
@@ -458,14 +488,61 @@ class UniTextAudioFaceModel(nn.Module):
             annot_type="qxsk_inhouse_blendshape_weight",
             fps=25
         )
+        # print(f"[_a2f_generated] out_motion: {out_motion.shape}, dtype: {out_motion.dtype} ,audio_feature: {audio_feature.shape}")  # torch.Size([1, 269, 61]), dtype: torch.float32 ,audio_feature: torch.Size([1, 269, 768])
 
-        # 获取到顶点数据
+        # 4. 静音段到音频段平滑过渡
+        if last_face_motion is not None:  # 保证音频从上个静音段->本次音频段平滑
+            transition_frames = min(3, T)  # 前3帧
+            last_frame = last_face_motion[:, 0, :].unsqueeze(1)  # [B, 1, 61]
+            # alpha: [transition_frames] = [1/3, 2/3, 1]
+            alpha = torch.linspace(1 / transition_frames, 1.0, steps=transition_frames, device=out_motion.device).view(
+                1, transition_frames, 1)
+            out_motion[:, :transition_frames, :] = (1 - alpha) * last_frame + alpha * out_motion[
+                :, :transition_frames, :]
+
+        # 5. arkit -> 顶点
         out_vertices = self.a2f_loss_module.get_vertices(out_motion.cuda(), annot_type="qxsk_inhouse_blendshape_weight")
 
-        return out_vertices  # [T, V, 3]
+        return out_vertices, out_motion  # 顶点[T, V, 3] ,  arkit[1, T, 61]
 
+    def _a2f_generated_zero_face(self, state, num_frames, decay_frames=10):
+        '''
+        生成与音频静音段相同时长的表情衰减段
+        arkit shape: (1, num_frames, 61)
 
+        策略：
+            保证表情从音频段->静音段平滑
+            线性衰减插值：
+            - 前 decay_frames 帧，将上一帧表情 last_face_motion 线性衰减到零
+            - alpha = max(0.0, 1 - i / decay_frames)
+                - i = 当前帧索引，从 0 到 num_frames-1
+                - decay_frames 内 alpha 从 1 线性减小到 0
+            - 每帧表情 out_motion[:, i, :] = last_face_motion * alpha
+            - 如果静音段长度超过 decay_frames，则后续帧保持全零
+            - 这样保证了：
+                - 静音段前半部分平滑从最后一帧表情过渡到静止
+                - 静音段后半部分完全静止，无突兀表情
+        '''
 
+        if state.last_face_motion is not None:  # last_face_motion: [1, 1, 61]
+            last_motion = state.last_face_motion  # [1, 1, 61]
+        else:
+            last_motion = torch.zeros((1, 1, 61), device=self.device, dtype=torch.float32)
+
+        # 扩展到静音段长度
+        out_motion = torch.zeros((1, num_frames, 61), device=self.device, dtype=torch.float32)
+
+        # 计算每帧衰减系数
+        for i in range(num_frames):
+            alpha = max(0.0, 1 - i / decay_frames)  # 前 decay_frames 帧线性衰减到0
+            out_motion[:, i, :] = last_motion[:, 0, :] * alpha
+
+        # 转换为顶点
+        out_vertices = self.a2f_loss_module.get_vertices(
+            out_motion.cuda(), annot_type="qxsk_inhouse_blendshape_weight"
+        )
+
+        return out_vertices, out_motion  # 静音段顶点[T, V, 3], 静音段arkit[1, T, 61]
 
 
     def state_dict(self, *args, destination=None, prefix="", keep_vars=False):

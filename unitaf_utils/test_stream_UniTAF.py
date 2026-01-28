@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 import torch
 from omegaconf import OmegaConf
 import torchaudio
@@ -20,13 +21,16 @@ def test_unitaf_stream(unitaf):
     motion_list = []
     sampling_rate = None
 
+    start_time = time.time()
+    first_chunk_time = None
+
     for stream_output in unitaf.indextts2_unitalker_stream_inference(
             spk_audio_prompt='examples/voice_zhongli.wav',
             text=text,
             emo_alpha=0.6,
             use_emo_text=True,
             emo_text=text,  # 情感控制选择从传入的情感文本中推断，不传额外用于推断的情感文本时则直接从目标文本中推断。
-            interval_silence=0,  # 200 流式生成chunk之间的静音段间隔,
+            interval_silence=200,  # 200 流式生成chunk之间的静音段间隔,
             verbose=False,
             max_text_tokens_per_segment=120,
             more_segment_before=0,
