@@ -23,8 +23,10 @@ def test_unitaf_stream(unitaf):
 
     start_time = time.time()
     first_chunk_time = None
+    last_chunk_time = time.time()
+    torch.cuda.reset_peak_memory_stats()
 
-    for stream_output in unitaf.indextts2_unitalker_stream_inference(
+    for i, stream_output in enumerate(unitaf.indextts2_unitalker_stream_inference(
             spk_audio_prompt='examples/voice_zhongli.wav',
             text=text,
             emo_alpha=0.6,
@@ -34,11 +36,24 @@ def test_unitaf_stream(unitaf):
             verbose=False,
             max_text_tokens_per_segment=120,
             more_segment_before=0,
-        ):
+        )):
         '''
-        {"sr": sr, "wav": wav_chunk,
-         "fps": 25, "motion": motion_vertices}  (T, V, 3) or None
+        {
+            "sr": sr, 
+            "wav": wav_chunk, 
+            "fps": 25, 
+            "motion": motion_vertices,  # (T, V, 3) or None
+        }
         '''
+        if first_chunk_time is None:
+            first_chunk_time = time.time()
+            print(f"[PERF] TTFB: {first_chunk_time - start_time:.3f}s")
+
+        now = time.time()
+        print(f"[PERF] chunk {i}, dt={(now - last_chunk_time) * 1000:.1f} ms")
+        last_chunk_time = now
+        print(torch.cuda.max_memory_allocated() / 1024 ** 2, "MB")
+
         # 收集流式生成的音频和表情
         wav = stream_output["wav"]
         if isinstance(wav, list):
@@ -49,9 +64,19 @@ def test_unitaf_stream(unitaf):
         if stream_output["motion"] is not None:
             motion_list.append(stream_output["motion"])
 
+    end_time = time.time()
+
     # # 插入静音并合并所有音频段
     # wav_list = unitaf.tts_model.insert_interval_silence(wav_list, sampling_rate=sampling_rate, interval_silence=200)  # 与 infer_generator的参数一致
     wav = torch.cat(wav_list, dim=1)  # 沿时间维度拼接
+    audio_length = wav.shape[-1] / sampling_rate
+    print("============== PERF SUMMARY ==============")
+    print(f"TTFB: {first_chunk_time - start_time:.3f}s")
+    print(f"Total inference time: {end_time - start_time:.2f}s")
+    print(f"Audio length: {audio_length:.2f}s")
+    print(f"RTF: {(end_time - start_time) / audio_length:.3f}")
+    print("==========================================")
+
     wav.cpu()
     # 合并表情顶点
     motion = torch.cat(motion_list, dim=0)  # 沿时间维度拼接

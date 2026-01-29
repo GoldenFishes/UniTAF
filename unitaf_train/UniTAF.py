@@ -25,7 +25,7 @@ from dataclasses import dataclass
 @dataclass
 class A2FStreamState:
     '''
-    保存 A2F 流式推理的中间状态
+    保存 UniTAF 中 A2F 流式推理的中间状态
     '''
     audio_feat_cache = None  # 尚未消费完的 audio feature
     last_face_motion = None  # 记录最后一帧表情, arkit格式 [1, 1, 61], 用于静音段的复制
@@ -100,7 +100,13 @@ class UniTextAudioFaceModel(nn.Module):
                 '''
                 推理模式下self.tts_model对应整个IndexTTS2，其中我们训练的核心自回归transformer权重应当替换加载self.tts_model.gpt
                 '''
-                self.tts_model = self.build_inference_indextts2_model()  # 在UniTAFIndexTTS2中就已经预设好训练模式了
+                self.tts_model = self.build_inference_indextts2_model(
+                    use_fp16=False,
+                    use_cuda_kernel=False,
+                    use_deepspeed=False,
+                    use_accel=True,  # 需要装Flash Attn, 非常有效，建议开，其他加速的效果不明显
+                    use_torch_compile=False,
+                )  # 在UniTAFIndexTTS2中就已经预设好训练模式了
 
             if "UniTalker" in cfg["a2f_model"]:
                 # 尝试获取配置文件中a2f微调权重,如果没有,则载入预训练的权重
@@ -345,8 +351,8 @@ class UniTextAudioFaceModel(nn.Module):
                                               use_emo_text, emo_text, use_random, interval_silence,
                                               verbose, max_text_tokens_per_segment, stream_return=True, more_segment_before=more_segment_before):
 
-            print("=" * 80)
-            print("[TTS STREAM STEP]")
+            # print("=" * 80)
+            # print("[TTS STREAM STEP]")
             # print(f"sr = {sr}") #  22050
 
             assert isinstance(wav_chunk, torch.Tensor), f"在正常音频或静音段时，wav_chunk都应当为torch.Tensor, 然而目前却是{type(wav_chunk)}"
@@ -354,11 +360,11 @@ class UniTextAudioFaceModel(nn.Module):
 
             a2f_state.audio_samples_total += audio_samples_chunk  # 把增量音频采样数累积到 a2f流式状态中
 
-            print(f"audio_samples 增量 / 总量 = {audio_samples_chunk} / {a2f_state.audio_samples_total}")
+            # print(f"audio_samples 增量 / 总量 = {audio_samples_chunk} / {a2f_state.audio_samples_total}")
 
             # --- 2. audio_feature 增量 ---
             if audio_feature is not None:
-                print(f"audio_feature 增量 = {tuple(audio_feature.shape)}")
+                # print(f"audio_feature 增量 = {tuple(audio_feature.shape)}")
 
                 # 缓存增量到 a2f_state
                 if a2f_state.audio_feat_cache is None:
@@ -366,7 +372,8 @@ class UniTextAudioFaceModel(nn.Module):
                 else:
                     a2f_state.audio_feat_cache = torch.cat([a2f_state.audio_feat_cache, audio_feature], dim=1)
             else:
-                print("audio_feature 增量 = None (施加与音频静音段相同的表情静音段)")
+                # print("audio_feature 增量 = None (施加与音频静音段相同的表情静音段)")
+                pass
 
             # --- 3. 调用 A2F 流式 step ---
             motion_vertices, a2f_state = self._a2f_stream_step(
@@ -374,9 +381,7 @@ class UniTextAudioFaceModel(nn.Module):
                 audio_sr=sr,
                 face_fps=25
             )  # 返回增量 motion_vertices [T, V, 3]
-
-            if motion_vertices is not None:
-                print(f"motion_vertices shape = {tuple(motion_vertices.shape)}")
+            # print(f"motion_vertices shape = {tuple(motion_vertices.shape)}")
 
             # --- yield 流式结果 ---
             yield {
@@ -412,18 +417,18 @@ class UniTextAudioFaceModel(nn.Module):
         new_frames = max_face_frames - state.face_frames_generated  # 计算本次能新增多少帧
         if new_frames <= 0:
             return None, state
-        print(f"[_a2f_stream_step] 允许的最大新帧数 = {new_frames}")
+        # print(f"[UniTAF][_a2f_stream_step] 允许的最大新帧数 = {new_frames}")
 
-
+        # 静音段生成相同长度的静止表情
         if state.audio_feat_cache is None:
-            # 静音段生成相同长度的静止表情
             out_vertices, out_motion = self._a2f_generated_zero_face(state, num_frames=new_frames)
             state.last_face_motion = out_motion[:, -1:]  # 保存最后一帧的表情顶点 [1, 1, 61]
+        # 正常音频段则调用a2f从audio_feature推断出相应的表情
         else:
             # a2f部分推理（audio feature projector + a2f）
             out_vertices, out_motion = self._a2f_generated(state)  # 返回当前特征片段的表情顶点输出  [T, V, 3] 和 arkit输出 [1, T, 61]
             state.last_face_motion = out_motion[:,-1:]  # 保存最后一帧的表情顶点 [1, 1, 61]
-        print(f"[_a2f_stream_step] 输出顶点形状 = {out_vertices.shape}")
+        # print(f"[UniTAF][_a2f_stream_step] 输出顶点形状 = {out_vertices.shape}")
 
         # 实际新增帧数如果超过 new_frames，则截断 out_vertices.size(1)
         T_use = min(new_frames, out_vertices.size(0))
@@ -622,7 +627,14 @@ class UniTextAudioFaceModel(nn.Module):
 
         return model.to(device)
 
-    def build_inference_indextts2_model(self):
+    def build_inference_indextts2_model(
+            self,
+            use_fp16=False,
+            use_cuda_kernel=False,
+            use_deepspeed=False,
+            use_accel=False,
+            use_torch_compile=False,
+    ):
         '''
         如果有自己微调gpt权重，则替换配置文件中的权重路径
         '''
@@ -635,8 +647,11 @@ class UniTextAudioFaceModel(nn.Module):
             cfg=indextts2_cfg,
             gpt_ckpt=gpt_ckpt,
             model_dir="checkpoints",
-            use_cuda_kernel=False,  # 禁用CUDA内核
-            use_torch_compile=True  # 启用torch.compile优化
+            use_fp16=use_fp16,
+            use_cuda_kernel=use_cuda_kernel,  # 禁用CUDA内核
+            use_deepspeed=use_deepspeed,
+            use_accel=use_accel,
+            use_torch_compile=use_torch_compile  # 启用torch.compile优化
         )
         return tts_model
 
