@@ -243,8 +243,12 @@ class UniTAFIndexTTS2(IndexTTS2):
         self.gr_progress = None
         self.model_version = self.cfg.version if hasattr(self.cfg, "version") else None
 
-    def infer(self, spk_audio_prompt, text,
-              emo_audio_prompt=None, emo_alpha=1.0,
+    def infer(self,
+              spk_audio_prompt,
+              text,
+              emo_audio_prompt=None,
+              emo_cond_emb=None,  # 如果直接传入从音频中提取的情感嵌入，则替代从emo_audio_prompt音频中重新推断的操作。
+              emo_alpha=1.0,
               emo_vector=None,
               use_emo_text=False, emo_text=None, use_random=False, interval_silence=200,
               verbose=False, max_text_tokens_per_segment=120, stream_return=False, more_segment_before=0,
@@ -256,6 +260,7 @@ class UniTAFIndexTTS2(IndexTTS2):
             spk_audio_prompt: 说话人参考音频路径
             text: 要合成的文本
             emo_audio_prompt: 情感参考音频路径
+            emo_cond_emb: 从情感参考音频中推断出的情感嵌入，效果与emo_audio_prompt一致，省去从音频进行推断出emo_cond_emb的步骤
             emo_alpha: 情感混合强度
             emo_vector: 手动指定的情感向量
             use_emo_text: 是否从文本中提取情感
@@ -270,7 +275,7 @@ class UniTAFIndexTTS2(IndexTTS2):
             # 流式推理模式
             return self.infer_generator(
                 spk_audio_prompt, text,
-                emo_audio_prompt, emo_alpha,
+                emo_audio_prompt, emo_cond_emb, emo_alpha,
                 emo_vector,
                 use_emo_text, emo_text, use_random, interval_silence,
                 verbose, max_text_tokens_per_segment, stream_return, more_segment_before, **generation_kwargs
@@ -280,7 +285,7 @@ class UniTAFIndexTTS2(IndexTTS2):
             try:
                 return list(self.infer_generator(
                     spk_audio_prompt, text,
-                    emo_audio_prompt, emo_alpha,
+                    emo_audio_prompt, emo_cond_emb, emo_alpha,
                     emo_vector,
                     use_emo_text, emo_text, use_random, interval_silence,
                     verbose, max_text_tokens_per_segment, stream_return, more_segment_before, **generation_kwargs
@@ -289,7 +294,7 @@ class UniTAFIndexTTS2(IndexTTS2):
                 return
 
     def infer_generator(self, spk_audio_prompt, text,
-            emo_audio_prompt=None, emo_alpha=1.0,
+            emo_audio_prompt=None, emo_cond_emb=None, emo_alpha=1.0,
             emo_vector=None,
             use_emo_text=False, emo_text=None, use_random=False, interval_silence=200,
             verbose=False, max_text_tokens_per_segment=120, stream_return=False, quick_streaming_tokens=0,
@@ -299,6 +304,9 @@ class UniTAFIndexTTS2(IndexTTS2):
         1. 增加将中间audio feature返回出来以供后续a2f模型使用。
             我们选择将 self.s2mel.models['gpt_layer'](latent) 输出的特征作为可被后续a2f模型接收的audio_feature
         2. 移除output_path，音频的保存功能在外部实现，而不再infer_generator中实现了。
+
+        3. 增加情感控制条件下：直接传入从emo_audio_prompt提取好的emo_cond_emb。
+            当接收到emo_cond_emb时，执行与emo_audio_prompt相同的从音频推断情感，但是直接应用emo_cond_emb结果与spk_cond_emb合并。
 
         原方法：生成器形式的推理函数，支持流式输出
         """
@@ -317,6 +325,7 @@ class UniTAFIndexTTS2(IndexTTS2):
             # / "emotion reference voice", to ensure we use correct emotion mixing!
             # 使用文本或情感向量引导时，移除情感参考音频以确保正确的情感混合
             emo_audio_prompt = None
+            emo_cond_emb = None  # 移除情感参考音频的条件嵌入
 
         if use_emo_text:
             # / automatically generate emotion vectors from text prompt
@@ -427,7 +436,16 @@ class UniTAFIndexTTS2(IndexTTS2):
             emovec_mat = emovec_mat.unsqueeze(0)  # 添加批次维度 torch.Size([1, 1280])
 
         # 情感条件缓存处理 ------------------------------------------------
-        if self.cache_emo_cond is None or self.cache_emo_audio_prompt != emo_audio_prompt:
+        # 显式传入的 emo_cond_emb > cache_emo_cond > emo_audio_prompt 重新计算
+
+        # 如果直接传入 emo_cond_emb，直接用（最高优先级）
+        if emo_cond_emb is not None:
+            emo_cond_emb = emo_cond_emb.to(self.device)  # 确保 device 一致
+            self.cache_emo_cond = emo_cond_emb
+            self.cache_emo_audio_prompt = None
+
+        # 没有显式 emo_cond_emb，才走 cache / audio
+        elif self.cache_emo_cond is None or self.cache_emo_audio_prompt != emo_audio_prompt:
             if self.cache_emo_cond is not None:
                 self.cache_emo_cond = None
                 torch.cuda.empty_cache()
@@ -448,6 +466,8 @@ class UniTAFIndexTTS2(IndexTTS2):
             # 更新情感条件缓存
             self.cache_emo_cond = emo_cond_emb
             self.cache_emo_audio_prompt = emo_audio_prompt
+
+        # cache 命中
         else:
             emo_cond_emb = self.cache_emo_cond
 
@@ -708,6 +728,28 @@ class UniTAFIndexTTS2(IndexTTS2):
             # wav_data = wav.type(torch.int16)
             # wav_data = wav_data.numpy().T  # 转置为(采样点数, 声道数)格式
             yield sampling_rate, wav, audio_feature
+
+    def get_emo_cond_emb_from_audio(self, emo_audio_prompt, verbose=False):
+        '''
+        从情感音频 emo_audio_prompt 中获取情感条件嵌入 emo_cond_emb
+        用于为数据集中音频标注情感控制特征
+        '''
+        # 加载和处理情感音频
+        emo_audio, _ = self._load_and_cut_audio(emo_audio_prompt, 15, verbose, sr=16000)
+        print(f"[DEBUG] emo_audio shape:{emo_audio.shape}")  # torch.Size([1, 46289])
+
+        emo_inputs = self.extract_features(emo_audio, sampling_rate=16000, return_tensors="pt")
+        emo_input_features = emo_inputs["input_features"]
+        emo_attention_mask = emo_inputs["attention_mask"]
+        emo_input_features = emo_input_features.to(self.device)
+        emo_attention_mask = emo_attention_mask.to(self.device)
+        print(f"[DEBUG] emo_attention_mask: {emo_attention_mask.shape}")  # torch.Size([1, 144])
+        print(f"[DEBUG] emo_input_features: {emo_input_features.shape}")  # torch.Size([1, 144, 160])
+
+        emo_cond_emb = self.get_emb(emo_input_features, emo_attention_mask)
+        return emo_cond_emb
+
+
 
 
 def find_most_similar_cosine(query_vector, matrix):

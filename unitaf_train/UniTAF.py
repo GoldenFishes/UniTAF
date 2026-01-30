@@ -22,6 +22,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass
 
+import torchaudio
+
 @dataclass
 class A2FStreamState:
     '''
@@ -87,7 +89,6 @@ class UniTextAudioFaceModel(nn.Module):
 
                 # 如果训练a2f时，只训练adapter部分（a2f.audio_feature_projector）
                 if cfg["train_a2f_adapter_only"]:
-                    import torchaudio
                     # 用于将为IndexTTS准备的24k采样音频重采样为16k，作为UniTalker Encoder输入
                     self.resample = torchaudio.transforms.Resample(orig_freq=24_000, new_freq=16_000).to(device)  # 放到跟模型同一设备
 
@@ -192,7 +193,6 @@ class UniTextAudioFaceModel(nn.Module):
             rander：是否进行渲染，无论是否流式，渲染都是最后再渲染
             **generation_kwargs： IndexTTS2.infer_generator中接收的其他参数，暂时不详
         '''
-        import torchaudio
 
         # 必须是IndexTTS2与UniTalker Decoder的联合模型的推理模式
         assert "IndexTTS2" in self.cfg["tts_model"] and "UniTalker" in self.cfg["a2f_model"]
@@ -913,17 +913,44 @@ if __name__ == '__main__':
     # 5. 尝试推理
     if unitaf.mode == "inference":
         text = "清晨的阳光透过窗帘洒在书桌上，新的一天开始了。窗外鸟儿欢快地歌唱，空气中弥漫着淡淡的花香。"
-        unitaf.indextts2_unitalker_inference(
+
+        # 测试单独分离从音频获取emo_cond_emb并施加情感控制
+        emo_cond_emb = unitaf.tts_model.get_emo_cond_emb_from_audio(
+            emo_audio_prompt="outputs/experiment3_explicit_emotion/furina_悲伤_低落_afraid.wav"
+        )  # 从音频中提取情感嵌入 emo_cond_emb
+        sr, wav, audio_feature = unitaf.tts_model.infer(
             spk_audio_prompt='examples/voice_zhongli.wav',
             text=text,
-            tts_output_path="outputs/UniTAF_output.wav",
-            a2f_output_path="outputs/UniTAF_output.npz",
+            emo_audio_prompt=None,
+            emo_cond_emb=emo_cond_emb,
             emo_alpha=0.6,
-            use_emo_text=True,
-            emo_text=text,  # 情感控制选择从传入的情感文本中推断，不传额外用于推断的情感文本时则直接从目标文本中推断。
-            verbose=True,   # 音频生成过程是否打印
-            render=True,  #是否渲染表情
         )
+
+        # 保存音频
+        tts_output_path = "outputs/UniTAF_output.wav"
+        if os.path.isfile(tts_output_path):
+            os.remove(tts_output_path)
+            print(">> remove old wav file:", tts_output_path)
+        if os.path.dirname(tts_output_path) != "":
+            os.makedirs(os.path.dirname(tts_output_path), exist_ok=True)
+
+        torchaudio.save(tts_output_path, wav.type(torch.int16), sr)  # 保存为16位PCM
+        print(">> wav file saved to:", tts_output_path)
+
+
+
+
+        # unitaf.indextts2_unitalker_inference(
+        #     spk_audio_prompt='examples/voice_zhongli.wav',
+        #     text=text,
+        #     tts_output_path="outputs/UniTAF_output.wav",
+        #     a2f_output_path="outputs/UniTAF_output.npz",
+        #     emo_alpha=0.6,
+        #     use_emo_text=True,
+        #     emo_text=text,  # 情感控制选择从传入的情感文本中推断，不传额外用于推断的情感文本时则直接从目标文本中推断。
+        #     verbose=True,   # 音频生成过程是否打印
+        #     render=True,  #是否渲染表情
+        # )
 
 
 
