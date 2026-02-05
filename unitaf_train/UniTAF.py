@@ -120,6 +120,15 @@ class UniTextAudioFaceModel(nn.Module):
                 )
                 self.a2f_model.eval()
 
+                # 尝试获取配置文件中表情部分的微调权重,如果没有,则重新初始化
+                ckpt = self.cfg.get("finetune_checkpoint", {}).get("expression_model") or None
+                self.expression_model = self.build_expression_model(
+                    cfg=cfg,
+                    checkpoint=Path(ckpt) if ckpt else None,
+                    device=device,
+                )
+                self.expression_model.eval()
+
                 # ----对UniTalker进行包修复----
                 # UniTalker loss计算所需的包 chumpy 最后一次更新停留在 2018 年，内部用了 Python 3 已废弃的 inspect.getargspec，在 Python≥3.11 会报：
                 # AttributeError: module 'inspect' has no attribute 'getargspec'
@@ -198,22 +207,28 @@ class UniTextAudioFaceModel(nn.Module):
         assert "IndexTTS2" in self.cfg["tts_model"] and "UniTalker" in self.cfg["a2f_model"]
         assert self.mode == "inference"
 
+        print(f"[Debug] use_emo_text :{use_emo_text}")
         # 1. tts生成
-        tts_gen = self.tts_model.infer(spk_audio_prompt, text,
-              emo_audio_prompt, emo_alpha,
-              emo_vector,
-              use_emo_text, emo_text, use_random, interval_silence,
-              verbose, max_text_tokens_per_segment, stream_return, more_segment_before)
+        tts_gen = self.tts_model.infer(
+            spk_audio_prompt=spk_audio_prompt, text=text,
+            emo_audio_prompt=emo_audio_prompt, emo_alpha=emo_alpha,
+            emo_vector=emo_vector,
+            use_emo_text=use_emo_text, emo_text=emo_text, use_random=use_random, interval_silence=interval_silence,
+            verbose=verbose, max_text_tokens_per_segment=max_text_tokens_per_segment,
+            stream_return=stream_return, more_segment_before=more_segment_before
+        )
 
         print("获得结果")
         # 取最后一次 yield 的值
         if stream_return:
             # 流式模式：tts_result 是生成器
-            for sr, wav, audio_feature in tts_gen:
+            for sr, wav, audio_feature, emovec_contrl in tts_gen:
                 pass  # 循环会获取最后一个值
         else:
             # 非流式模式：tts_result 已经是 (sr, wav_data, audio_feature) 元组
-            sr, wav, audio_feature = tts_gen
+            sr, wav, audio_feature, emovec_contrl = tts_gen
+
+        expression_input = audio_feature
 
         # 保存音频
         if tts_output_path:
@@ -232,7 +247,7 @@ class UniTextAudioFaceModel(nn.Module):
         audio_feature = F.pad(audio_feature, (0, 0, 0, 1), mode='constant', value=0)  # (B, L+1, 1024)
         audio_feature = self.audio_feature_projector(audio_feature)
 
-        # 3. a2f生成
+        # 3. a2f生成，主要生成口型准确的模型（不带情感控制）
         '''
         face_template: 用于表示说话人静态的脸形，因此是一个与标注格式的表示形状FLAME相同的初始偏移量
             但是在arkit中我们不需要这个，故而保持和我们标注格式相同维度的0向量即可
@@ -246,7 +261,7 @@ class UniTextAudioFaceModel(nn.Module):
         identity = torch.full((B,),self.a2f_model.model_cfg["identity_num"] - 1,
                               dtype=torch.long, device=audio_feature.device)
 
-        out_motion, _, _ = self.a2f_model(
+        mouth_motion, _, _ = self.a2f_model(
             audio_feature=audio_feature,
             template=face_template,
             face_motion=None,
@@ -255,12 +270,21 @@ class UniTextAudioFaceModel(nn.Module):
             fps=25
         )
 
-        # 处理 out_motion，确保它是 Tensor 并且在正确的设备上
-        print(f"out_motion 类型: {type(out_motion)}")
-        print(f"out_motion 设备: {getattr(out_motion, 'device', 'N/A')}")
+        # 处理 mouth_motion，确保它是 Tensor 并且在正确的设备上
+        print(f"mouth_motion 类型: {type(mouth_motion)}")
+        print(f"mouth_motion 设备: {getattr(mouth_motion, 'device', 'N/A')}")
+
+        # 4. 使用expression model根据生成好的口型数据生成表情残差
+        expression_motion = self.expression_model(
+            expression_feature=expression_input,
+            mouth_motion=mouth_motion.detach(),
+            emotion_contrl=emovec_contrl
+        )
+        print(f"[Expression Model] 输出 {expression_motion.shape}")
+        # TODO: 如何合并，如何单独展示？
 
         # 获取到顶点数据
-        out = self.a2f_loss_module.get_vertices(out_motion.cuda(), annot_type="qxsk_inhouse_blendshape_weight")
+        out = self.a2f_loss_module.get_vertices(mouth_motion.cuda(), annot_type="qxsk_inhouse_blendshape_weight")
 
         # 处理out以便保存
         if isinstance(out, torch.Tensor):
@@ -296,6 +320,7 @@ class UniTextAudioFaceModel(nn.Module):
                 device="cuda"  # 或 "cpu"
             )
 
+    # TODO：流式生成暂时未增加表情优化expression model模块
     def indextts2_unitalker_stream_inference(
         self,
         # TTS部分（IndexTTS2）所需参数
@@ -347,10 +372,11 @@ class UniTextAudioFaceModel(nn.Module):
         '''
 
         # tts生成, 返回的是增量
-        for sr, wav_chunk, audio_feature in self.tts_model.infer(spk_audio_prompt, text, emo_audio_prompt, emo_alpha,emo_vector,
-                                              use_emo_text, emo_text, use_random, interval_silence,
-                                              verbose, max_text_tokens_per_segment, stream_return=True, more_segment_before=more_segment_before):
-
+        for sr, wav_chunk, audio_feature, emovec_contrl in self.tts_model.infer(
+                spk_audio_prompt=spk_audio_prompt, text=text, emo_audio_prompt=emo_audio_prompt, emo_alpha=emo_alpha,emo_vector=emo_vector,
+                use_emo_text=use_emo_text, emo_text=emo_text, use_random=use_random, interval_silence=interval_silence,
+                verbose=verbose, max_text_tokens_per_segment=max_text_tokens_per_segment, stream_return=True, more_segment_before=more_segment_before
+        ):
             # print("=" * 80)
             # print("[TTS STREAM STEP]")
             # print(f"sr = {sr}") #  22050
@@ -549,7 +575,6 @@ class UniTextAudioFaceModel(nn.Module):
 
         return out_vertices, out_motion  # 静音段顶点[T, V, 3], 静音段arkit[1, T, 61]
 
-
     def state_dict(self, *args, destination=None, prefix="", keep_vars=False):
         """
         保存：只返回需要训练的参数
@@ -736,6 +761,36 @@ class UniTextAudioFaceModel(nn.Module):
                     # bias 已经是 False，无需处理
         return proj
 
+    def build_expression_model(self, cfg, checkpoint, device):
+        '''
+        构建表情模型，表情模型接收
+
+        '''
+        from unitaf_train_component.expression_model_component import ExpressionModel
+
+        # 根据UniTAF前置其他组件获得具体维度
+        if "IndexTTS2" in cfg["tts_model"]:
+            gpt_dim = 1024
+            emo_dim = 1280
+
+        if "UniTalker" in cfg["a2f_model"]:
+            face_dim = 61
+
+        model = ExpressionModel(
+            gpt_dim=gpt_dim,  # e.g. 1024
+            face_dim=face_dim,  # e.g. 61
+            emo_dim=emo_dim,  # emovec dim
+            hidden_dim=cfg["expression_model"].get("hidden_dim", 256),
+            num_layers=cfg["expression_model"].get("num_layers", 4),
+        ).to(device)
+
+        if checkpoint is not None and checkpoint.exists():
+            state = torch.load(checkpoint, map_location="cpu")
+            model.load_state_dict(state, strict=False)
+            print(f"[ExpressionModel] Loaded checkpoint from {checkpoint}")
+
+        return model
+
 
 
 # ---------- 一次性检查工具方法 ----------
@@ -798,7 +853,7 @@ if __name__ == '__main__':
     加载模型权重后可以打印查看结构等，请逐步解注释后续打印的方法。
     """
     # 将测试限制在固定卡上
-    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+    os.environ["CUDA_VISIBLE_DEVICES"] = "7"
 
     # 添加项目根目录到Python路径
     current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -812,14 +867,14 @@ if __name__ == '__main__':
         "tts_model": ["IndexTTS2"],
         "a2f_model": ["UniTalker"],
         # 模型配置
-        "IndexTTS2": {
+        "IndexTTS2": {  # TTS
             # TTS Loss计算时设置
             "use_duration_control": False,
             "duration_dropout": 0.3,
             "text_loss_weight": 0.2,
             "mel_loss_weight": 0.8,
         },
-        "UniTalker": {
+        "UniTalker": {  # A2F 主要用于生成口型
             # UniTalker Decoder配置, 参数与UniTalker项目的config/unitalker.yaml一致
             "interpolate_pos": 1,
             "decoder_dimension": 256,
@@ -834,6 +889,10 @@ if __name__ == '__main__':
             # 以下需要从外部获得并更新：
             "audio_encoder_feature_dim": 768,  # 原始UniTalker Decoder接收特征维度是768，我们需要经过projector使得音频特征输出相同维度
             "identity_num": 20,  # 假设是20，需要根据不同数据集决定
+        },
+        "expression_model": {  # 提供从口型到完整面部的情感表情残差
+            "hidden_dim": 256,
+            "num_layers": 4,
         },
         # 数据集类
         "dataset_config": {
@@ -914,43 +973,42 @@ if __name__ == '__main__':
     if unitaf.mode == "inference":
         text = "清晨的阳光透过窗帘洒在书桌上，新的一天开始了。窗外鸟儿欢快地歌唱，空气中弥漫着淡淡的花香。"
 
-        # 测试单独分离从音频获取emo_cond_emb并施加情感控制
-        emo_cond_emb = unitaf.tts_model.get_emo_cond_emb_from_audio(
-            emo_audio_prompt="outputs/experiment3_explicit_emotion/furina_悲伤_低落_afraid.wav"
-        )  # 从音频中提取情感嵌入 emo_cond_emb
-        sr, wav, audio_feature = unitaf.tts_model.infer(
-            spk_audio_prompt='examples/voice_zhongli.wav',
-            text=text,
-            emo_audio_prompt=None,
-            emo_cond_emb=emo_cond_emb,
-            emo_alpha=0.6,
-        )
-
-        # 保存音频
-        tts_output_path = "outputs/UniTAF_output.wav"
-        if os.path.isfile(tts_output_path):
-            os.remove(tts_output_path)
-            print(">> remove old wav file:", tts_output_path)
-        if os.path.dirname(tts_output_path) != "":
-            os.makedirs(os.path.dirname(tts_output_path), exist_ok=True)
-
-        torchaudio.save(tts_output_path, wav.type(torch.int16), sr)  # 保存为16位PCM
-        print(">> wav file saved to:", tts_output_path)
-
-
-
-
-        # unitaf.indextts2_unitalker_inference(
+        # # 测试单独分离从音频获取emo_cond_emb并施加情感控制
+        # emo_cond_emb = unitaf.tts_model.get_emo_cond_emb_from_audio(
+        #     emo_audio_prompt="outputs/experiment3_explicit_emotion/furina_悲伤_低落_afraid.wav"
+        # )  # 从音频中提取情感嵌入 emo_cond_emb
+        # sr, wav, audio_feature, emovec_contrl = unitaf.tts_model.infer(
         #     spk_audio_prompt='examples/voice_zhongli.wav',
         #     text=text,
-        #     tts_output_path="outputs/UniTAF_output.wav",
-        #     a2f_output_path="outputs/UniTAF_output.npz",
+        #     emo_audio_prompt=None,
+        #     emo_cond_emb=emo_cond_emb,
         #     emo_alpha=0.6,
-        #     use_emo_text=True,
-        #     emo_text=text,  # 情感控制选择从传入的情感文本中推断，不传额外用于推断的情感文本时则直接从目标文本中推断。
-        #     verbose=True,   # 音频生成过程是否打印
-        #     render=True,  #是否渲染表情
+        #     stream_return=False
         # )
+        #
+        # # 保存音频
+        # tts_output_path = "outputs/UniTAF_output.wav"
+        # if os.path.isfile(tts_output_path):
+        #     os.remove(tts_output_path)
+        #     print(">> remove old wav file:", tts_output_path)
+        # if os.path.dirname(tts_output_path) != "":
+        #     os.makedirs(os.path.dirname(tts_output_path), exist_ok=True)
+        #
+        # torchaudio.save(tts_output_path, wav.type(torch.int16), sr)  # 保存为16位PCM
+        # print(">> wav file saved to:", tts_output_path)
+
+
+        unitaf.indextts2_unitalker_inference(
+            spk_audio_prompt='examples/voice_zhongli.wav',
+            text=text,
+            tts_output_path="outputs/UniTAF_output.wav",
+            a2f_output_path="outputs/UniTAF_output.npz",
+            emo_alpha=0.6,
+            use_emo_text=True,
+            emo_text=text,  # 情感控制选择从传入的情感文本中推断，不传额外用于推断的情感文本时则直接从目标文本中推断。
+            verbose=False,   # 音频生成过程是否打印
+            render=True,  #是否渲染表情
+        )
 
 
 

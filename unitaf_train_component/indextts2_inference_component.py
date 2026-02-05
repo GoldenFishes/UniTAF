@@ -507,7 +507,7 @@ class UniTAFIndexTTS2(IndexTTS2):
 
         # 初始化变量
         wavs = []
-        audio_features = []
+        audio_features = []  # a2f 口型生成的音频特征输入 与 表情补全Expression model的音频特征输入
         gpt_gen_time = 0
         gpt_forward_time = 0
         s2mel_time = 0
@@ -550,6 +550,9 @@ class UniTAFIndexTTS2(IndexTTS2):
                         emovec = emovec_mat + (1 - torch.sum(weight_vector)) * emovec  # torch.Size([1, 1280])
                         # emovec = emovec_mat
                         # print(f"[DEBUG] 混合后emovec: {emovec.shape}")  # torch.Size([1, 1280])
+
+                    # 获取此处emovec作为expression model的显示情感控制输入
+                    emovec_contrl = emovec  # torch.Size([1, 1280])
 
                     # 语音推理生成语义编码
                     # codes 为生成的目标音频的codes，但是要拿去s2mel前还得过一边gpt前向去得到latent；speech_conditioning_latent 为条件
@@ -687,13 +690,13 @@ class UniTAFIndexTTS2(IndexTTS2):
                 # wavs.append(wav[:, :-512])
                 wavs.append(wav.cpu())  # 转移到CPU并保存 / to cpu before saving
                 if stream_return:
-                    yield sampling_rate, wav.cpu(), audio_feature  # 流式返回当前段
+                    yield sampling_rate, wav.cpu(), audio_feature, emovec_contrl  # 流式返回当前段
 
                     if interval_silence > 0:  # 当静音段为0时，不应该返回静音段
                         if silence == None:
                             silence = self.interval_silence(wavs, sampling_rate=sampling_rate,
                                                             interval_silence=interval_silence)
-                        yield sampling_rate, silence, None  # 返回静音段
+                        yield sampling_rate, silence, None, emovec_contrl  # 返回静音段
 
         # 合成结束 ------------------------------------------------
         end_time = time.perf_counter()
@@ -727,7 +730,7 @@ class UniTAFIndexTTS2(IndexTTS2):
             # # 返回以符合Gradio的格式要求
             # wav_data = wav.type(torch.int16)
             # wav_data = wav_data.numpy().T  # 转置为(采样点数, 声道数)格式
-            yield sampling_rate, wav, audio_feature
+            yield sampling_rate, wav, audio_feature, emovec_contrl
 
     def get_emo_cond_emb_from_audio(self, emo_audio_prompt, verbose=False):
         '''
