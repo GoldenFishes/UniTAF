@@ -616,6 +616,84 @@ def render_npz_video(out_np: np.ndarray,          # [T, V, 3] 顶点序列
     os.remove(tmp_path)
     print(f">> 视频已生成：{final_path} ({T} 帧, 约 {T/fps:.2f} s)")
 
+def render_multi_window_video(
+    verts_dict: dict,       # dict: {'mouth': np.ndarray, 'expr': np.ndarray, 'final': np.ndarray}
+    audio_path: str,
+    out_dir: str,
+    annot_type: str,
+    device: str = "cuda",
+    window_names: list = ["mouth", "expression", "final"],
+    font_scale: float = 0.6,
+    font_thickness: int = 2,
+    text_height: int = 20,   # 上方文字区域高度
+):
+    """
+    将多个顶点序列渲染成多窗口对比视频
+    用于比对 口型，表情，最终合并的渲染适配
+    verts_dict: dict, key -> 顶点序列 np.ndarray [T, V, 3]
+    """
+    from pathlib import Path
+    import cv2
+    import torch
+    import numpy as np
+    import os, subprocess
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    # 1. 渲染每个顶点序列
+    img_arrays = {}
+    for key in window_names:
+        verts_np = verts_dict[key]
+        verts = torch.Tensor(verts_np).to(device)
+        faces = torch.from_numpy(get_obj_faces(annot_type)[None]).to(device)
+        imgs = render_meshes(verts, faces, (512, 512))  # [T, H, W, 4]
+        imgs = (imgs[..., :3].cpu().numpy() * 255).astype(np.uint8)  # RGB
+
+        # 在每帧上方增加文字区域
+        T, H, W, C = imgs.shape
+        canvas_imgs = []
+        for t in range(T):
+            canvas = np.zeros((H + text_height, W, C), dtype=np.uint8)
+            canvas[text_height:, :, :] = imgs[t]
+            cv2.putText(canvas, key, (10, int(text_height * 0.8)),
+                        cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255),
+                        font_thickness, cv2.LINE_AA)
+            canvas_imgs.append(canvas)
+        img_arrays[key] = np.array(canvas_imgs)
+
+    # 2. 检查帧数一致
+    T = min([v.shape[0] for v in img_arrays.values()])
+    for key in img_arrays:
+        img_arrays[key] = img_arrays[key][:T]
+
+    # 3. 水平拼接
+    concat_imgs = []
+    for t in range(T):
+        imgs_row = [img_arrays[key][t] for key in window_names]
+        concat_imgs.append(np.concatenate(imgs_row, axis=1))
+    concat_imgs = np.array(concat_imgs)  # [T, H, W_total, 3]
+
+    # 4. 输出文件
+    out_key = Path(audio_path).stem if audio_path else "demo"
+    tmp_path = str(Path(out_dir) / f"{out_key}_tmp.mp4")
+    final_path = str(Path(out_dir) / f"{out_key}_multiwindow.mp4")
+    if os.path.isfile(final_path):
+        os.remove(final_path)
+
+    # 5. 写入临时视频
+    fps = 25
+    array_to_video(concat_imgs, tmp_path, fps=fps)
+
+    # 6. 混音 / 无声
+    if audio_path and os.path.exists(audio_path):
+        cmd = (f'ffmpeg -i {tmp_path} -i {audio_path} -c:v copy -c:a aac '
+               f'-shortest -strict -2 {final_path} -y')
+    else:
+        cmd = f'ffmpeg -i {tmp_path} -c:v copy {final_path} -y'
+    subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    os.remove(tmp_path)
+    print(f">> 多窗口视频已生成：{final_path} ({T} 帧, 约 {T/fps:.2f} s)")
+
 
 def render_video_for_evaluate(
     gt_waveform,

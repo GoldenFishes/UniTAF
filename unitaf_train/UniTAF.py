@@ -281,20 +281,26 @@ class UniTextAudioFaceModel(nn.Module):
             emotion_contrl=emovec_contrl
         )
         print(f"[Expression Model] 输出 {expression_motion.shape}")
-        # TODO: 如何合并，如何单独展示？
 
-        # 获取到顶点数据
-        out = self.a2f_loss_module.get_vertices(mouth_motion.cuda(), annot_type="qxsk_inhouse_blendshape_weight")
+        # 5. 合并 mouth 和 expression 残差
+        final_motion = mouth_motion + expression_motion
 
-        # 处理out以便保存
-        if isinstance(out, torch.Tensor):
-            if out.is_cuda:  # 如果 out 是 CUDA tensor，先移到 CPU
-                out_cpu = out.cpu()
-            else:
-                out_cpu = out
-            out_np = out_cpu.detach().numpy()  # 分离计算图并转换为 numpy
-        else:
-            out_np = out  # 如果已经是 numpy 或其他类型
+        # 1) 纯口型
+        mouth_vertices = self.a2f_loss_module.get_vertices(
+            mouth_motion.cuda(), annot_type="qxsk_inhouse_blendshape_weight")
+        # 2) 纯表情残差（仅残差）
+        expr_vertices = self.a2f_loss_module.get_vertices(
+            expression_motion.cuda(), annot_type="qxsk_inhouse_blendshape_weight")
+        # 3) 合并后的完整表情
+        final_vertices = self.a2f_loss_module.get_vertices(
+            final_motion.cuda(), annot_type="qxsk_inhouse_blendshape_weight")
+
+
+        # 处理输出arkit以便保存
+        mouth_np = mouth_vertices.detach().cpu().numpy()
+        expr_np = expr_vertices.detach().cpu().numpy()
+        final_np = final_vertices.detach().cpu().numpy()
+
 
         if a2f_output_path:
             if os.path.isfile(a2f_output_path):
@@ -303,22 +309,36 @@ class UniTextAudioFaceModel(nn.Module):
             if os.path.dirname(a2f_output_path) != "":
                 os.makedirs(os.path.dirname(a2f_output_path), exist_ok=True)
             # 保存结果为npz文件
-            np.savez(a2f_output_path, out_np)
+            np.savez(a2f_output_path,
+                     mouth=mouth_np,
+                     expr=expr_np,
+                     final=final_np)
             print(f">> face results save to {a2f_output_path}")
 
         if tts_output_path and a2f_output_path and render:
-            from unitaf_train_component.render import render_npz_video
+            from unitaf_train_component.render import render_npz_video, render_multi_window_video
             parent_dir = Path(a2f_output_path).parent
             parent_str = parent_dir.as_posix()
-            # 进行渲染
-            render_npz_video(
-                out_np=out_np,
-                audio_path=tts_output_path,  # 原始 wav 完整路径；None=无声
-                out_dir=parent_str,  # 想把视频/图片保存文件夹
-                annot_type="qxsk_inhouse_blendshape_weight",  # 你当时传给 get_vertices 的同一字符串
-                save_images=False,  # False=直接出 mp4；True=出逐帧 png
-                device="cuda"  # 或 "cpu"
+
+            # render_npz_video(
+            #     out_np=out_np,
+            #     audio_path=tts_output_path,  # 原始 wav 完整路径；None=无声
+            #     out_dir=parent_str,  # 想把视频/图片保存文件夹
+            #     annot_type="qxsk_inhouse_blendshape_weight",  # 你当时传给 get_vertices 的同一字符串
+            #     save_images=False,  # False=直接出 mp4；True=出逐帧 png
+            #     device="cuda"  # 或 "cpu"
+            # )  # 渲染单个表情
+
+            # 渲染 口型，表情残差，合并表情
+            verts_dict = {"mouth": mouth_np, "expression": expr_np, "final": final_np}
+            render_multi_window_video(
+                verts_dict=verts_dict,
+                audio_path=tts_output_path,
+                out_dir=parent_str,
+                annot_type="qxsk_inhouse_blendshape_weight",
+                device="cuda"
             )
+
 
     # TODO：流式生成暂时未增加表情优化expression model模块
     def indextts2_unitalker_stream_inference(
@@ -776,13 +796,28 @@ class UniTextAudioFaceModel(nn.Module):
         if "UniTalker" in cfg["a2f_model"]:
             face_dim = 61
 
-        model = ExpressionModel(
-            gpt_dim=gpt_dim,  # e.g. 1024
-            face_dim=face_dim,  # e.g. 61
-            emo_dim=emo_dim,  # emovec dim
-            hidden_dim=cfg["expression_model"].get("hidden_dim", 256),
-            num_layers=cfg["expression_model"].get("num_layers", 4),
-        ).to(device)
+        mode = cfg["expression_model"].get("mode", "film")
+        assert mode in ["film", "cross_attn"]
+        # 情感通过FiLM控制
+        if mode == "film":
+            model = ExpressionModel(
+                gpt_dim=gpt_dim,  # e.g. 1024
+                face_dim=face_dim,  # e.g. 61
+                emo_dim=emo_dim,  # emovec dim
+                mode=mode,
+                hidden_dim=cfg["expression_model"].get("hidden_dim", 256),
+                num_layers=cfg["expression_model"].get("num_layers", 4),
+            ).to(device)
+        # 情感通过Cross Attn融合
+        elif mode == "cross_attn":
+            model = ExpressionModel(
+                gpt_dim=gpt_dim,  # e.g. 1024
+                face_dim=face_dim,  # e.g. 61
+                emo_dim=emo_dim,  # emovec dim
+                mode=mode,
+                nhead=cfg["expression_model"].get("nhead", 4),
+                dropout=cfg["expression_model"].get("dropout", 0.1),
+            ).to(device)
 
         if checkpoint is not None and checkpoint.exists():
             state = torch.load(checkpoint, map_location="cpu")
@@ -891,8 +926,15 @@ if __name__ == '__main__':
             "identity_num": 20,  # 假设是20，需要根据不同数据集决定
         },
         "expression_model": {  # 提供从口型到完整面部的情感表情残差
+            # mode = 'film':  传统的时序 + FiLM 控制
+            # mode = 'cross_attn': 使用跨注意力（Cross Attention）进行模态融合
+            "mode": "cross_attn",
+            # FiLM参数
             "hidden_dim": 256,
             "num_layers": 4,
+            # Cross Attn参数
+            "nhead": 4,
+            "dropout": 0.1,
         },
         # 数据集类
         "dataset_config": {

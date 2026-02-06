@@ -255,6 +255,7 @@ class UniTAFIndexTTS2(IndexTTS2):
               **generation_kwargs):
         """
         覆盖原始IndexTTS2.infer() 移除output_path，保存步骤将不再该内部进行
+        同时传出需要为后续 口型生成（a2f） 和 表情生成（expression model）的audio feature特征与情感条件emovec
 
         主要推理接口参数:
             spk_audio_prompt: 说话人参考音频路径
@@ -645,7 +646,8 @@ class UniTAFIndexTTS2(IndexTTS2):
                     latent = self.s2mel.models['gpt_layer'](latent)  # GPT层处理
                     # print(f"--s2mel.models['gpt_layer']输出： {latent}")
                     audio_feature = latent
-                    audio_features.append(audio_feature)  # 我们将这里的特征作为后续a2f的输入
+                    # 我们将这里的特征作为后续a2f的输入，todo：暂时也将该特征作为expression model输入
+                    audio_features.append(audio_feature)
 
                     # print(f"--s2mel.models['gpt_layer']输出： {latent.shape}")  # torch.Size([1, 304, 1024])
                     S_infer = self.semantic_codec.quantizer.vq2emb(
