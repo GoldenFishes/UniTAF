@@ -557,6 +557,7 @@ class UniTAFIndexTTS2(IndexTTS2):
 
                     # 语音推理生成语义编码
                     # codes 为生成的目标音频的codes，但是要拿去s2mel前还得过一边gpt前向去得到latent；speech_conditioning_latent 为条件
+                    # 用于产生mel token
                     codes, speech_conditioning_latent = self.gpt.inference_speech(
                         spk_cond_emb,
                         text_tokens,
@@ -621,6 +622,7 @@ class UniTAFIndexTTS2(IndexTTS2):
                 m_start_time = time.perf_counter()
                 use_speed = torch.zeros(spk_cond_emb.size(0)).to(spk_cond_emb.device).long()
                 with torch.amp.autocast(text_tokens.device.type, enabled=self.dtype is not None, dtype=self.dtype):
+                    # 拿已经生成好的mel token (codes)重放，得到高质量连续的latent用于后续s2mel / diffusion等进一步生成。
                     latent = self.gpt(
                         speech_conditioning_latent,
                         text_tokens,

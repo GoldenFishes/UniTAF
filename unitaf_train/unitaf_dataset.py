@@ -79,6 +79,7 @@ class UniTAFDataset(Dataset):
             from indextts.gpt.model_v2 import UnifiedVoice
             from indextts.utils.front import TextNormalizer, TextTokenizer
             from unitaf_train_component.indextts2_train_component import SemanticExtractor
+            from transformers import SeamlessM4TFeatureExtractor
             from indextts.utils.maskgct_utils import build_semantic_codec, build_semantic_model
             from huggingface_hub import hf_hub_download
             from indextts.s2mel.modules.campplus.DTDNN import CAMPPlus
@@ -103,6 +104,17 @@ class UniTAFDataset(Dataset):
             safetensors.torch.load_model(self.semantic_codec, semantic_code_ckpt)
             self.semantic_codec = self.semantic_codec.to(self.dataset_config["device"])
             self.semantic_codec.eval()
+
+            # 用于从情感音频提示emo_audio_prompt中提取情感的特征提取器
+            self.extract_features = SeamlessM4TFeatureExtractor.from_pretrained("facebook/w2v-bert-2.0")
+
+            # 用于情感控制的语义模型
+            self.semantic_model, self.semantic_mean, self.semantic_std = build_semantic_model("checkpoints/wav2vec2bert_stats.pt")
+            self.semantic_model = self.semantic_model.to(self.dataset_config["device"])
+            self.semantic_model.eval()
+            self.semantic_mean = self.semantic_mean.to(self.dataset_config["device"])
+            self.semantic_std = self.semantic_std.to(self.dataset_config["device"])
+
 
             # IndexTTS2中核心自回归Transformer的封装模型UnifiedVoice
             gpt = UnifiedVoice(**indextts2_cfg.gpt)
@@ -291,6 +303,24 @@ class UniTAFDataset(Dataset):
             token+1 就可得50个token表示一秒 故而9.6s音频用480-1个token表示，8s音频用400-1个token表示
             '''
 
+            # 4. 处理情感控制
+            # 将目标音频作为情感控制, 即作为emo_audio_prompt
+            emo_audio, _ = self._load_and_cut_audio(second_chunk["audio_path"], 15, verbose=False, sr=16000)
+            emo_inputs = self.extract_features(emo_audio, sampling_rate=16000, return_tensors="pt")
+            emo_input_features = emo_inputs["input_features"]
+            emo_attention_mask = emo_inputs["attention_mask"]
+            emo_input_features = emo_input_features.to(self.dataset_config["device"])
+            emo_attention_mask = emo_attention_mask.to(self.dataset_config["device"])
+            emo_cond_emb = self.get_emb(emo_input_features, emo_attention_mask)
+
+            # 提取说话人风格特征
+            audio_16k = torchaudio.transforms.Resample(st_sr, 16000)(gt_waveform)  # 重采样到16kHz
+            feat = torchaudio.compliance.kaldi.fbank(audio_16k.to(cond_feat.device), num_mel_bins=80, dither=0,
+                                                     sample_frequency=16000)
+            feat = feat - feat.mean(dim=0, keepdim=True)  # feat2另外一个滤波器能量组特征[L, 80]
+            style = self.campplus_model(feat.unsqueeze(0))  # torch.Size([1, 192])
+
+
             # 在推理模式下进行特征提取
             with torch.inference_mode():
                 # 提取GT音频token：使用语义编解码器对特征进行量化，得到离散token
@@ -310,15 +340,17 @@ class UniTAFDataset(Dataset):
                 # print("[DEBUG] conditioning:", conditioning.shape)  # torch.Size([32, 1280])
 
                 # 提取情感向量：使用GPT模型获取情感特征
-                emo_vec = self.gpt.get_emovec(gt_feat, gt_lengths.to(gt_feat.device))
-                # 如果数据集中有情感向量
+                '''
+                推理中使用的是self.gpt.merge_emovec()分别对spk_cond_emb和emo_cond_emb调用self.gpt.get_emovec()
+                获取情感向量后加权。这里我们直接使用self.gpt.get_emovec()只对emo_cond_emb （GT audio）获取情感向量
+                '''
+                # emo_vec = self.gpt.get_emovec(gt_feat, gt_lengths.to(gt_feat.device))  # 社区训练代码的实现中，这里直接从gt_feat获取，本质上一样。
+                emo_vec = self.gpt.get_emovec(emo_cond_emb, torch.tensor([emo_cond_emb.shape[-1]], device=self.dataset_config["device"]))
+
+                # 如果数据集中有情感向量, 情感向量处理
                 if second_chunk.get("text_emotion_vector", None) is not None:
                     weight_vector = torch.tensor(second_chunk["text_emotion_vector"], device=emo_vec.device)
-                    # 提取说话人风格特征
-                    audio_16k = torchaudio.transforms.Resample(st_sr, 16000)(gt_waveform)  # 重采样到16kHz
-                    feat = torchaudio.compliance.kaldi.fbank(audio_16k.to(cond_feat.device), num_mel_bins=80, dither=0, sample_frequency=16000)
-                    feat = feat - feat.mean(dim=0, keepdim=True)  # feat2另外一个滤波器能量组特征[L, 80]
-                    style = self.campplus_model(feat.unsqueeze(0))  # torch.Size([1, 192])
+
                     # 基于余弦相似度选择最相似的情感
                     random_index = [self.find_most_similar_cosine(style, tmp) for tmp in self.spk_matrix]
                     # 构建情感矩阵
@@ -567,11 +599,52 @@ class UniTAFDataset(Dataset):
         most_similar_index = torch.argmax(similarities)
         return most_similar_index
 
+    def _load_and_cut_audio(self,audio_path,max_audio_length_seconds,verbose=False,sr=None):
+        """
+        加载并裁剪音频文件, 从IndexTTS2._load_and_cut_audio()中复制而来
+        增加了full_path数据集路径补全
+        """
+        import librosa
+
+        audio_path = audio_path.replace('\\', '/')
+        full_path = os.path.join(
+            self.dataset_config["dataset_root_path"],
+            self.sub_dataset_config["dirname"],
+            audio_path
+        )
+
+        if not sr:
+            audio, sr = librosa.load(full_path)  # 使用librosa默认采样率加载
+        else:
+            audio, _ = librosa.load(full_path,sr=sr)  # 使用指定采样率加载
+
+        audio = torch.tensor(audio).unsqueeze(0)  # 添加批次维度
+        max_audio_samples = int(max_audio_length_seconds * sr)  # 计算最大采样点数
+
+        # 如果音频过长，进行裁剪
+        if audio.shape[1] > max_audio_samples:
+            if verbose:
+                print(f"音频过长 ({audio.shape[1]} 采样点)，截断为 {max_audio_samples} 采样点")
+            audio = audio[:, :max_audio_samples]
+        return audio, sr
+
+    @torch.no_grad()
+    def get_emb(self, input_features, attention_mask):
+        """获取语义嵌入, 从IndexTTS2.get_emb()中复制而来"""
+        vq_emb = self.semantic_model(
+            input_features=input_features,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+        )
+        feat = vq_emb.hidden_states[17]  # (B, T, C)
+        feat = (feat - self.semantic_mean) / self.semantic_std  # 标准化
+        return feat
+
 
 if __name__ == '__main__':
     '''
     测试 UniTAFDataset
-    python unitaf_train/unitaf_dataset.py
+    python -m unitaf_train.unitaf_dataset
     
     该脚本测试结果打印中collate_fn部分有误是正常的，实际训练中会以UniTAFTrainer中的collate_batch实现为准
     '''
@@ -589,7 +662,7 @@ if __name__ == '__main__':
         # 数据集根目录
         "dataset_root_path": "/home/zqg/project/data/UniTAF Dataset",  # 使用绝对路径
         # 预处理组件所在设备
-        "device": "cuda:0",
+        "device": "cuda:7",
     }
 
     print("开始测试 UniTAFDataset...")
@@ -598,7 +671,7 @@ if __name__ == '__main__':
     try:
         # 1. 测试数据集初始化
         print("1. 初始化数据集...")
-        dataset = UniTAFDataset(dataset_config, dataset_name="D12", dataset_type="train")  # 对应{dataset_type}.json文件
+        dataset = UniTAFDataset(dataset_config, dataset_name="D13", dataset_type="train")  # 对应{dataset_type}.json文件
         print(f"✓ 数据集初始化成功")
         print(f"  数据集大小: {len(dataset)} 个样本")
         print(f"  子数据集路径: {dataset.sub_dataset_path}")

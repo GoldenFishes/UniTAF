@@ -653,7 +653,7 @@ class IndexTTS2:
                         emo_cond_emb,
                         torch.tensor([spk_cond_emb.shape[-1]], device=text_tokens.device),
                         torch.tensor([emo_cond_emb.shape[-1]], device=text_tokens.device),
-                        alpha=emo_alpha
+                        alpha=emo_alpha  # 越接近1.0则越接近情感参考音频
                     )
                     # print(f"[DEBUG] emovec.shape: {emovec.shape}")  # torch.Size([1, 1280])
 

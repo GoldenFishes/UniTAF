@@ -104,6 +104,7 @@ class CrossAttnBlock(nn.Module):
         return x
 
 
+# TODO: 接收说话人条件
 class ExpressionModel(nn.Module):
     '''
     这是一个条件残差生成器（conditional residual generator）
