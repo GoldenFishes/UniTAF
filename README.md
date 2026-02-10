@@ -1,10 +1,16 @@
 # UniTAF
 
- 
+.
+
+### TODO:
+
+- 实现情感控制的表情生成（训练expression_model）
+
+.
 
 ## 1. Install
 
- 
+.
 
 以下三种安装方式任选其一
 
@@ -26,7 +32,7 @@ git lfs pull
 > git lfs install
 > ```
 
- 
+.
 
 **2.下载权重**
 
@@ -42,7 +48,7 @@ git lfs pull
 │   ├── UniTalker-L-D0-D7.pt
 ```
 
- 
+.
 
 **3.确保安装包管理工具uv**
 
@@ -52,7 +58,7 @@ pip install -U uv
 
 > *所有* *`uv`* *命令都会自动激活每个项目的**虚拟环境**。在运行* *`UV`* *命令之前 ，千万不要手动激活任何环境，因为这可能导致依赖冲突！*
 
- 
+.
 
 **4.安装必须依赖**
 
@@ -74,7 +80,7 @@ uv sync --all-extras --default-index "https://mirrors.tuna.tsinghua.edu.cn/pypi/
 
 > 如果安装过程中出现CUDA错误，请确保CUDA Toolkit版本为12.8或更高！
 
- 
+.
 
 **5.通过uv工具下载模型**
 
@@ -98,7 +104,7 @@ hf download ATA-space/UniTAF --local-dir=unitaf_ckpt
 > $env:HF_ENDPOINT = "https://hf-mirror.com"
 > ```
 
- 
+.
 
 **6.诊断 PyTorch GPU 加速**
 
@@ -133,7 +139,7 @@ uv run tools/gpu_check.py
 >
 > 下载并安装（Windows专用）： https://aka.ms/vs/17/release/vc_redist.x64.exe 。安装完成后重启终端或电脑即可解决。
 
- 
+.
 
 **7.安装补充包**
 
@@ -164,7 +170,7 @@ python setup.py install
 > python -c "import pytorch3d; print(pytorch3d.__version__)"
 > ```
 
- 
+.
 
 **安装 Flash Attn 加速** https://github.com/Dao-AILab/flash-attention/releases
 
@@ -183,7 +189,7 @@ print(flash_attn.__version__)
 EOF
 ```
 
- 
+.
 
 **安装 ffmpeg**
 
@@ -193,7 +199,7 @@ sudo apt update
 sudo apt install -y ffmpeg
 ```
 
- 
+.
 
 ### B. 使用pip安装
 
@@ -204,7 +210,7 @@ conda create -n unitaf python=3.11 -y
 conda activate unitaf
 ```
 
- 
+.
 
 **1.安装 pytorch**
 
@@ -214,7 +220,7 @@ conda activate unitaf
 pip install torch==2.8.* torchaudio==2.8.* --index-url https://download.pytorch.org/whl/cu128 --no-deps
 ```
 
- 
+.
 
 **2.安装其他依赖**
 
@@ -225,7 +231,7 @@ pip install -r requirements.txt
 
 > 这里如果有清华源，则会报错证书问题。请确保删除清华源，仅使用官方源。
 
- 
+.
 
 **3.下载模型**
 
@@ -256,7 +262,7 @@ hf download ATA-space/UniTAF --local-dir=unitaf_ckpt
 │   ├── UniTalker-L-D0-D7.pt
 ```
 
- 
+.
 
 **4.安装补充包**
 
@@ -287,7 +293,7 @@ python setup.py install
 > python -c "import pytorch3d; print(pytorch3d.__version__)"
 > ```
 
- 
+.
 
 **安装 Flash Attn** 加速 https://github.com/Dao-AILab/flash-attention/releases
 
@@ -306,7 +312,7 @@ print(flash_attn.__version__)
 EOF
 ```
 
- 
+.
 
 **安装 ffmpeg**
 
@@ -316,7 +322,7 @@ sudo apt update
 sudo apt install -y ffmpeg
 ```
 
- 
+.
 
 ### C. 使用AutoDL镜像（推荐）
 
@@ -324,7 +330,7 @@ sudo apt install -y ffmpeg
 
 https://www.autodl.art/i/GoldenFishes/UniTAF/UniTAF
 
- 
+.
 
 ## 2. Inference
 
@@ -337,7 +343,7 @@ uv run python unitaf_train/UniTAF.py
 python unitaf_train/UniTAF.py
 ```
 
- 
+.
 
 ### 2.1 UniTAF流式调用
 
@@ -359,14 +365,14 @@ yield {
 
 需要在外部接收并额外保存。
 
- 
+.
 
 非流式推理入口函数为：
 `UniTextAudioFaceModel.indextts2_unitalker_inference()`
 
 非流式推理直接在函数内部保存音频，表情与渲染的适配
 
- 
+.
 
 ### 2.2 UniTAF情感控制
 
@@ -374,7 +380,7 @@ UniTAF沿用与IndexTTS2相同的情感调用方式
 
 在以上推理入口 `indextts2_unitalker_stream_inference()` 与 `indextts2_unitalker_inference()` 传入以下参数即可进行可控情感生成。
 
- 
+.
 
 | 参数               | 类型        | 说明                                                         | 使用场景                                                     |
 | ------------------ | ----------- | ------------------------------------------------------------ | ------------------------------------------------------------ |
@@ -472,29 +478,232 @@ UniTextAudioFaceModel.indextts2_unitalker_inference(
 text = "之前你做DE5很好，所以这一次也DEI3做DE2很好才XING2，如果这次目标完成得不错的话，我们就直接打DI1去银行取钱。"
 ```
 
- 
+.
 
-### 2.3 其他推理脚本
+### 2.3 其他脚本
 
 单独IndexTTS2批量实验脚本于 `./inference.py`
 
 UniTAF批量实验推理脚本于 `./unitaf_inference.py`
 
+调用并接收UniTAF流式生成结果的示例脚本于 `./unitaf_utils/test_stream_UniTAF.py`
 
+用于实时查看表情表示ARKit渲染的WebUI脚本于 `./unitaf_train_component/render_webui.py`
 
-
+.
 
 ## 3. Train
 
+训练脚本入口位于 `./unitaf_train/train_unitaf.py` ，配置好该脚本的参数后直接运行该脚本即可开始训练
 
+.
 
+### 3.1 UniTAF Dataset
 
+UniTAF模型训练使用特定格式的数据，数据集示例可以从[GoldenFishes/UniTAF-Dataset: UniTextAudioFace Dataset, a dataset for model combined TTS and A2F](https://github.com/GoldenFishes/UniTAF-Dataset)下载得到。
 
+该数据集由UniTalker数据集基础上修改得到，其包含文本-音频-表情数据对。数据集格式和预处理方法见数据集仓库的自述文件。
 
+.
+
+### 3.2 training config
+
+配置文件十分重要！我们仅使用该一个配置文件来控制所有的参数与变量，不仅训练器 `UniTAFTrainer` 需要接收 `train_config`，推理时 `UniTextAudioFaceModel` 也需要接收相同格式的 `cfg` 。
+
+其中UniTAFTrainer接收的配置字典是最完整的配置字典，其余的单纯推理类 或 Dataset类接收的配置字典均是其与自身相关部分的子集。完整的配置字典示例如下（参考`unitaf_train/train_unitaf.py`中的配置字典）：
+
+```python
+train_config = {
+    # 模型类型，这里用于指导训练器类训练哪些模型
+    "tts_model": ["IndexTTS2"],
+    "a2f_model": ["UniTalker"],
+
+    # 为上面模型类型中包含的模型进行配置----------------------------------------------------------------------------------
+    "IndexTTS2": {
+        # TTS Loss计算时设置
+        "use_duration_control": False,
+        "duration_dropout": 0.3,
+        "text_loss_weight": 0.2,
+        "mel_loss_weight": 0.8,
+    },
+    "UniTalker": {
+        # UniTalker Decoder配置, 参数与UniTalker项目的config/unitalker.yaml一致
+        "interpolate_pos": 1,
+        "decoder_dimension": 256,
+        "decoder_type": "conv",
+        "period": 30,
+        "headlayer": 1,
+        # UniTalker Network
+        "use_pca": True,
+        "pca_dim": 256,
+        # A2F Loss计算时设置
+        "pca_weight": 0.01,
+        # 以下需要参数需要根据实际情况更新：
+        "audio_encoder_feature_dim": 768,  # 原始UniTalker-L-D0-D7.pt接收特征维度是1024，UniTalker-B-D0-D7.pt接收特征维度768。我们需要经过projector使得音频特征输出相同维度
+        "identity_num": 20,  # 暂定为20，实际在UniTalker Decoder权重加载时会从权重中得到这里的值并更新
+    },
+    "expression_model": {  # 提供从口型到完整面部的情感表情残差
+        "mode": "cross_attn", # "film"情感通过FiLM控制, "cross_attn"情感通过CrossAttention控制
+        # FiLM参数
+        "hidden_dim": 256,
+        "num_layers": 4,
+        # Cross Attn参数
+        "nhead": 4,
+        "dropout": 0.1,
+    },
+    # 数据集类-------------------------------------------------------------------------------------------------------
+    "dataset_config": {
+        "dataset_root_path": "/autodl-tmp/UniTAF-Dataset",  # 使用绝对路径
+        # 支持多数据集训练，对应unitaf_dataset_support_config中具体数据集
+        "dataset_list": ["D13"],  # "D12" , "D13"情感控制
+        # unitaf_dataset_support_config是经过数据集格式转换UniTAFDataset能够支持的数据集
+        # （UniTalker本身还有一个 a2f/dataset/dataset_config 记录UniTalker Decoder支持的数据集，
+        # 但我们只会以 unitaf_dataset_support_config 为准）
+    },
+    # 设备
+    "device": "cuda:0",  # 注: 需要与外部的CUDA_VISIBLE_DEVICES一致!但只有一个可见卡时，硬编码则应该是cuda：0
+    # 训练设置-------------------------------------------------------------------------------------------------------
+    "batch_size": 2,
+    "epochs": 10,
+    "grad_accumulation": 1,
+    "grad_clip": 1.0,
+    "use_amp": True,
+    "warmup_steps": 50, # 所有调度器统一参数 warmup 为50
+    "log_interval": 2,  # training_step 里打印 loss 的步长         # 20
+    "val_interval": 2000,  # 每隔多少 step 做一次验证               # 2000
+    "save_interval": 20000,  # 每隔多少 step 存一次 ckpt              # 20000
+    "output_dir": "./unitaf_ckpt/UniTAF-A2F_Expression-加载A2d预训练权重(口型状态系数空间加权_260109)_260206",  # 断点 & 日志保存根目录
+    "resume_path": None,  # 如需断点续训，填 ckpt 路径或 True
+    # 分别训练tts和a2f的配置
+    "train_tts": False,
+    "train_tts_lora": True,  # 仅 train_tts 时有效
+    "train_a2f": True,  # 只要训练a2f,则必须训练audio feature projector. 故不在额外增加投影层是否训练的参数判断了
+    "train_a2f_adapter_only": False,  # 训练a2f时，是否只训练adapter部分（a2f.audio_feature_projector）
+    "train_except_a2f_adapter": False,  # 训练a2f时，排除adapter部分（a2f.audio_feature_projector）
+    "train_a2f_expression_model": True,  #  只训练a2f中表情残差模型，冻结口型模型  目前a2f生成口型，expression model生成表情，最终合并成完整面部
+    # 优化器设置，为不同模块设置不同优化器
+    "tts_train_cfg": {
+        "lr": 5e-7,
+        "betas": (0.9, 0.999),
+        "weight_decay": 0.01,
+        "eps": 1e-08,
+    },
+    "tts_lora_cfg": {
+        "lora_target_modules": ["c_attn", "c_proj", "c_fc"],  # 只针对TTS中gpt,包括attn和mlp层
+        "lora_rank": 128,
+        "lora_alpha": 128,
+        "lora_dropout": 0.0,
+    },
+    "a2f_train_cfg": {
+        "lr": 1e-4,
+        "betas": (0.9, 0.999),
+        "weight_decay": 0.01,
+        "eps": 1e-08,
+    },
+    # 日志配置：
+    "report_to": "wandb",
+    # 加载指定模块的自定义权重用于替代官方预训练权重：
+    "finetune_checkpoint": {
+        # "tts_model":
+        #     "./unitaf_ckpt/UniTAF-A2F(lr_1e-4)- LoRA-TTS(lr_5e-7_rank_128)/checkpoint-20000/tts_model.pt",
+        "audio_feature_projector":
+            "./unitaf_ckpt/UniTAF-A2F(口型状态顶点空间加权loss_加权仅作用于嘴部顶点)-加载Adapter预训练权重(约束AudioFeature_step_74140)_260109/checkpoint-74140/audio_feature_projector.pt",
+        "a2f_model":
+            "./unitaf_ckpt/UniTAF-A2F(口型状态顶点空间加权loss_加权仅作用于嘴部顶点)-加载Adapter预训练权重(约束AudioFeature_step_74140)_260109/checkpoint-74140/a2f_model.pt",
+    }
+}
+```
+
+.
+
+其中支持分别加载TTS部分、Projector部分与A2F部分的自定义权重：
+
+```python
+train_config = {
+    ...
+    "finetune_checkpoint": {
+        # "tts_model": "...",
+        "audio_feature_projector": "...",
+        "a2f_model": "...",
+    }
+}
+```
+
+如果某个模块不加载自定义权重而使用官方权重（若audio_feature_projector无自定义权重则会初始化）则注释`train_config["finetune_checkpoint"]`中该模块的key即可。
+
+.
+
+其中支持分别训练tts和a2f的配置（我们为tts和a2f两个模块分别使用两个不同的优化器）：
+
+```python
+train_config = {
+    "train_tts": False,
+    "train_tts_lora": True,  # 仅 train_tts 时有效
+    # 只要训练a2f,则必须训练audio feature projector. 故不在额外增加投影层是否训练的参数判断了
+    "train_a2f": True,
+    # 训练a2f时，是否只训练adapter部分（a2f.audio_feature_projector）
+    "train_a2f_adapter_only": False,
+    # 训练a2f时，排除adapter部分（a2f.audio_feature_projector）
+    "train_except_a2f_adapter": False,
+    #  只训练a2f中表情残差模型，冻结口型模型。目前a2f生成口型，expression model生成表情，最终合并成完整面部
+    "train_a2f_expression_model": True,
+}
+```
+
+.
+
+其中在配置文件中指定数据集：
+
+```python
+train_config = {
+	"dataset_config": {
+        "dataset_root_path": "/autodl-tmp/UniTAF-Dataset",  # 使用绝对路径
+        # 支持多数据集训练，对应unitaf_dataset_support_config中具体数据集
+        "dataset_list": ["D13"],  # "D12" , "D13"情感控制
+        # unitaf_dataset_support_config是经过数据集格式转换UniTAFDataset能够支持的数据集
+        # （UniTalker本身还有一个 a2f/dataset/dataset_config 记录UniTalker Decoder支持的数据集，
+        # 但我们只会以 unitaf_dataset_support_config 为准）
+    },
+}
+```
+
+数据集子集的配置会根据 `unitaf_train/unitaf_dataset_support_config.py` 获取。 `unitaf_dataset_support_config` 是经过数据集格式转换UniTAFDataset能够支持的数据集
+
+> UniTalker本身还有一个 `a2f/dataset/dataset_config` 记录UniTalker Decoder支持的数据集，但我们只会以 `unitaf_dataset_support_config` 为准。
+
+如果要新增自己的数据集，则需要：
+
+1）先参考UniTAF Dataset制作标准[GoldenFishes/UniTAF-Dataset](https://github.com/GoldenFishes/UniTAF-Dataset)；
+
+2）在 `unitaf_train/unitaf_dataset_support_config.py` 中新增子集的配置；
+
+3）在传入的训练配置`train_config`中增加子集的名称，`train_config["dataset_config"]["dataset_list"]`
+
+.
+
+### 3.3 训练组件
+
+我们简要介绍UniTAF相关训练组件：
+
+```python
+UniTAF/
+├── unitaf_train
+│   ├── train_unitaf.py  	# 这里实现UniTAF Trainer与训练脚本入口
+│   ├── UniTAF.py   		# 模型加载器，这里区分以训练模式和推理模式加载模型，并实现推理逻辑
+│   ├── unitaf_dataset.py  	# UniTAF Dataset类，负责数据集读取和预处理
+│   └── unitaf_dataset_support_config.py  # 数据集配置
+└── unitaf_train_component
+    ├── audio_feature_projector.py  	# 将TTS的音频特征投影到A2F空间
+    ├── expression_model_component.py	# 用于学习情感表情残差的组件
+    ├── indextts2_inference_component.py	# IndexTTS2适配UniTAF的推理组件
+    ├── indextts2_train_component.py	# IndexTTS2适配UniTAF的训练组件
+    └── unitalker_decoder_component.py	# UniTAF中使用的UniTAlker Decoder组件
+...
+```
+
+.
 
 ## 4. License
 
 本项目在[IndexTTS2](https://github.com/index-tts/index-tts)与[UniTalker](https://github.com/X-niper/UniTalker)基础上构建，本项目作学术用途，本项目开源协议将遵守且沿用IndexTTS2与UniTalker的开源协议。
-
-
 
