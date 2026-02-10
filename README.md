@@ -10,18 +10,14 @@
 
 ### A. 使用UV安装
 
-
-
 1.克隆仓库
 
-```
+```python
 git clone https://github.com/GoldenFishes/UniTAF.git
 cd UniTAF
 # 下载大文件
 git lfs pull
 ```
-
-
 
 > ```
 > # linux安装lfs
@@ -29,6 +25,29 @@ git lfs pull
 > # 验证
 > git lfs install
 > ```
+
+2.下载权重
+
+
+
+
+
+下载UniTalker权重
+
+[UniTalker-B-[D0-D7\]](https://drive.google.com/file/d/1PmF8I6lyo0_64-NgeN5qIQAX6Bg0yw44/view?usp=sharing): The base model in UniTalker. Download it and place it in `./pretrained_models` .
+
+[UniTalker-L-[D0-D7\]](https://drive.google.com/file/d/1sH2T7KLFNjUnTM-V1eRMM1Tytxd2sYAp/view?usp=sharing): The default model in UniTalker.
+
+```python
+# Download it and place it in ./a2f/pretrained_models
+├── a2f/pretrained_models
+│   ├── UniTalker-B-D0-D7.pt
+│   ├── UniTalker-L-D0-D7.pt
+```
+
+
+
+
 
 2.确保安装包管理工具uv
 
@@ -62,5 +81,9 @@ uv sync --all-extras --default-index "https://mirrors.tuna.tsinghua.edu.cn/pypi/
 
 > 如果安装过程中出现CUDA错误，请确保CUDA Toolkit版本为12.8或更高！
 
-4.通过uv工具
+
+
+
+
+
 

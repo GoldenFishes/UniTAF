@@ -1,15 +1,15 @@
 '''
-这里用于解决5090服务器中直接运行命令
+这里用于解决服务器中证书错误问题，直接运行命令
 hf download IndexTeam/IndexTTS-2 --local-dir=checkpoints
-证书错误问题
 '''
 
 
 import os
 os.environ["SSL_CERT_FILE"] = "/etc/ssl/certs/ca-certificates.crt"
 os.environ["REQUESTS_CA_BUNDLE"] = "/etc/ssl/certs/ca-certificates.crt"
-os.environ["http_proxy"] = "http://qiangong.zhou:goldeneagle1A@172.16.2.57:3128"
-os.environ["https_proxy"] = "http://qiangong.zhou:goldeneagle1A@172.16.2.57:3128"
+# 替换下面的值为你的代理信息
+os.environ["http_proxy"] = "http://用户名:密码@代理服务器地址:端口"
+os.environ["https_proxy"] = "http://用户名:密码@代理服务器地址:端口"
 
 
 from huggingface_hub import snapshot_download
