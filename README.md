@@ -84,7 +84,7 @@ uv tool install "huggingface-hub[cli,hf_xet]"
 # 下载indextts2预训练模型
 hf download IndexTeam/IndexTTS-2 --local-dir=checkpoints
 # 下载UniTAF训练的权重
-hf download ATA-space/UniTAF --local-dir=untaf_ckpt
+hf download ATA-space/UniTAF --local-dir=unitaf_ckpt
 ```
 
 > 如果上述命令不可用，请阅读uv tool输出。它会告诉你如何将这些工具添加到系统路径中。
@@ -135,9 +135,30 @@ uv run tools/gpu_check.py
 
 
 
+**7.安装补充包**
+
+安装 Flash Attn 加速 https://github.com/Dao-AILab/flash-attention/releases
+
+找到 **UV环境中：**对应cuda版本，torch版本，python版本的 whl 安装包。下载并移动到Linux服务器中，在路径下执行：
+
+```Python
+# 使用你正确的安装包的名字，我们这里下载的安装包是对应python-3.10，torch-2.8.0+cu128的
+uv pip install ./flash_attn-2.8.3+cu12torch2.8cxx11abiTRUE-cp310-cp310-linux_x86_64.whl \
+  --no-deps \
+  --force-reinstall
+# 验证是否成功安装
+uv run python - << 'EOF'
+import flash_attn
+print("flash_attn import OK")
+print(flash_attn.__version__)
+EOF
+```
+
+
+
 ### B. 使用pip安装
 
-python 3.11 ， torch 2.8.0+cu128
+示例环境为：python 3.11 ， torch 2.8.0+cu128
 
 ```Python
 conda create -n unitaf python=3.11 -y
@@ -177,7 +198,7 @@ pip install -U "huggingface-hub<1.0"
 # 下载indextts2预训练模型
 hf download IndexTeam/IndexTTS-2 --local-dir=checkpoints
 # 下载UniTAF训练的权重
-hf download ATA-space/UniTAF --local-dir=untaf_ckpt
+hf download ATA-space/UniTAF --local-dir=unitaf_ckpt
 ```
 
 > 服务器网络证书故障时直接本地下载模型然后上传
@@ -247,6 +268,8 @@ EOF
 
 
 
+
+## 2. inference
 
 
 

@@ -56,6 +56,7 @@ dependencies = [
   "torchaudio==2.8.*",
   "tqdm>=4.67.1",
   "transformers==4.52.1",
+  "smplx==0.1.28",
 
   # Use "wetext" on Windows/Mac, otherwise "WeTextProcessing" on Linux.
   "wetext>=0.0.9; sys_platform != 'linux'",
@@ -115,3 +116,6 @@ name = "pytorch-cuda"
 url = "https://download.pytorch.org/whl/cu128"
 # Only use this index when explicitly requested by `tool.uv.sources`.
 explicit = true
+
+[tool.uv.extra-build-dependencies]
+chumpy = ["pip"]
