@@ -352,7 +352,7 @@ class UniTextAudioFaceModel(nn.Module):
         use_emo_text=False,
         emo_text=None,
         use_random=False,
-        interval_silence=0,  # 200 流式生成chunk之间的静音段间隔,
+        interval_silence=200,  # 200 流式生成chunk之间的静音段间隔,
         verbose=False,
         max_text_tokens_per_segment=120,
         more_segment_before=0,

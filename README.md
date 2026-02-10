@@ -318,7 +318,48 @@ sudo apt install -y ffmpeg
 
 
 
+### C. 使用AutoDL镜像（推荐）
+
+前往AutoDL镜像界面，已上传公开镜像：
+
+https://www.autodl.art/i/GoldenFishes/UniTAF/UniTAF
+
+
+
 ## 2. Inference
+
+快速调用示例：
+
+```python
+# UV 环境
+uv run python unitaf_train/UniTAF.py
+# conda 环境
+python unitaf_train/UniTAF.py
+```
+
+
+
+### 2.1 是否流式调用
+
+UniTAF模型的推理入口于 `unitaf_train/UniTAF.py` 中：
+
+其中流式推理入口函数为：
+`UniTextAudioFaceModel.indextts2_unitalker_stream_inference()`
+
+非流式推理入口函数为：
+`UniTextAudioFaceModel.indextts2_unitalker_inference()`
+
+
+
+### 2.2 情感控制
+
+UniTAF沿用与IndexTTS2相同的情感调用方式
+
+在以上推理入口 `indextts2_unitalker_stream_inference()` 与 `indextts2_unitalker_inference()` 传入以下参数即可进行可控情感生成。
+
+
+
+
 
 
 
@@ -336,7 +377,9 @@ sudo apt install -y ffmpeg
 
 
 
+## 4. License
 
+本项目在[IndexTTS2](https://github.com/index-tts/index-tts)与[UniTalker](https://github.com/X-niper/UniTalker)基础上构建，本项目作学术用途，本项目开源协议将遵守且沿用IndexTTS2与UniTalker的开源协议。
 
 
 
