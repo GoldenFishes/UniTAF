@@ -938,7 +938,7 @@ if __name__ == '__main__':
         },
         # 数据集类
         "dataset_config": {
-            "dataset_root_path": "/home/zqg/project/data/UniTAF Dataset",
+            "dataset_root_path": "/autodl-tmp/UniTAF-Dataset",
             "dataset_list": ["D12"]  # 这里测试也传数据集是用于指导模型选择何种输出头
         },
         # 加载指定的部分模块的微调权重。

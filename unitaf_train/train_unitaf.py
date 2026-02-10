@@ -1153,7 +1153,7 @@ if __name__ == '__main__':
         },
         # 数据集类-------------------------------------------------------------------------------------------------------
         "dataset_config": {
-            "dataset_root_path": "/home/zqg/project/data/UniTAF Dataset",  # 使用绝对路径
+            "dataset_root_path": "/autodl-tmp/UniTAF-Dataset",  # 使用绝对路径
             # 支持多数据集训练，对应unitaf_dataset_support_config中具体数据集
             "dataset_list": ["D13"],  # "D12" , "D13"情感控制
             # unitaf_dataset_support_config是经过数据集格式转换UniTAFDataset能够支持的数据集

@@ -660,7 +660,7 @@ if __name__ == '__main__':
         "tts_model": ["IndexTTS2"],
         "a2f_model": ["UniTalker"],
         # 数据集根目录
-        "dataset_root_path": "/home/zqg/project/data/UniTAF Dataset",  # 使用绝对路径
+        "dataset_root_path": "/autodl-tmp/UniTAF-Dataset",  # 使用绝对路径
         # 预处理组件所在设备
         "device": "cuda:7",
     }

@@ -137,7 +137,36 @@ uv run tools/gpu_check.py
 
 **7.安装补充包**
 
-安装 Flash Attn 加速 https://github.com/Dao-AILab/flash-attention/releases
+**pytorch3d**，手动安装并编译：
+
+在project同级目录下：
+
+```Python
+git clone https://github.com/facebookresearch/pytorch3d.git
+cd pytorch3d
+```
+
+安装编译：
+
+```Python
+# 清空上次编译留下的临时文件
+python setup.py clean
+# 把 C/CUDA 扩展编译成当前目录下的共享库（*.so 或 *.pyd），但不复制到 site-packages；
+# --inplace 让生成的 .so 直接躺在源码目录，方便调试/即时 import。
+python setup.py build_ext --inplace
+# 把编译好的包复制到当前环境的 site-packages，并注册入口脚本，使 import pytorch3d 全局可用。
+python setup.py install
+```
+
+> 编译完验证：
+>
+> ```Python
+> python -c "import pytorch3d; print(pytorch3d.__version__)"
+> ```
+
+
+
+**安装 Flash Attn 加速** https://github.com/Dao-AILab/flash-attention/releases
 
 找到 **UV环境中：**对应cuda版本，torch版本，python版本的 whl 安装包。下载并移动到Linux服务器中，在路径下执行：
 
@@ -152,6 +181,16 @@ import flash_attn
 print("flash_attn import OK")
 print(flash_attn.__version__)
 EOF
+```
+
+
+
+**安装 ffmpeg**
+
+```python
+# Ubuntu / Debian
+sudo apt update
+sudo apt install -y ffmpeg
 ```
 
 
@@ -221,7 +260,7 @@ hf download ATA-space/UniTAF --local-dir=unitaf_ckpt
 
 **4.安装补充包**
 
-pytorch3d，手动安装并编译：
+**pytorch3d**，手动安装并编译：
 
 在project同级目录下：
 
@@ -248,7 +287,9 @@ python setup.py install
 > python -c "import pytorch3d; print(pytorch3d.__version__)"
 > ```
 
-安装 Flash Attn 加速 https://github.com/Dao-AILab/flash-attention/releases
+
+
+**安装 Flash Attn** 加速 https://github.com/Dao-AILab/flash-attention/releases
 
 找到对应cuda版本，torch版本，python版本的 whl 安装包。下载并移动到Linux服务器中，在路径下执行：
 
@@ -267,9 +308,29 @@ EOF
 
 
 
+**安装 ffmpeg**
+
+```python
+# Ubuntu / Debian
+sudo apt update
+sudo apt install -y ffmpeg
+```
 
 
-## 2. inference
+
+## 2. Inference
+
+
+
+
+
+
+
+
+
+## 3. Train
+
+
 
 
 
