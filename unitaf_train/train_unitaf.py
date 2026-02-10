@@ -1111,7 +1111,7 @@ if __name__ == '__main__':
     python unitaf_train/train_unitaf.py 
     '''
     # 设置使得Trainer限制在固定卡上
-    os.environ["CUDA_VISIBLE_DEVICES"] = "7"  # 只用第 0 号卡，此时会从可见卡开始编码cuda:0,cuda:1...
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # 只用第 0 号卡，此时会从可见卡开始编码cuda:0,cuda:1...
 
     train_config = {
         # 模型类型，这里用于指导训练器类训练哪些模型

@@ -79,8 +79,12 @@ uv sync --all-extras --default-index "https://mirrors.tuna.tsinghua.edu.cn/pypi/
 **5.通过uv工具下载模型**
 
 ```Shell
+# 安装hf
 uv tool install "huggingface-hub[cli,hf_xet]"
+# 下载indextts2预训练模型
 hf download IndexTeam/IndexTTS-2 --local-dir=checkpoints
+# 下载UniTAF训练的权重
+hf download ATA-space/UniTAF --local-dir=untaf_ckpt
 ```
 
 > 如果上述命令不可用，请阅读uv tool输出。它会告诉你如何将这些工具添加到系统路径中。
@@ -168,8 +172,12 @@ pip install -r requirements.txt
 下载IndexTTS2模型
 
 ```Python
+# 安装hf
 pip install -U "huggingface-hub<1.0"
+# 下载indextts2预训练模型
 hf download IndexTeam/IndexTTS-2 --local-dir=checkpoints
+# 下载UniTAF训练的权重
+hf download ATA-space/UniTAF --local-dir=untaf_ckpt
 ```
 
 > 服务器网络证书故障时直接本地下载模型然后上传

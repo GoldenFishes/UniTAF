@@ -888,7 +888,7 @@ if __name__ == '__main__':
     加载模型权重后可以打印查看结构等，请逐步解注释后续打印的方法。
     """
     # 将测试限制在固定卡上
-    os.environ["CUDA_VISIBLE_DEVICES"] = "7"
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
     # 添加项目根目录到Python路径
     current_dir = os.path.dirname(os.path.abspath(__file__))

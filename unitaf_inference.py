@@ -182,7 +182,7 @@ if __name__ == '__main__':
     根目录下运行 python unitaf_inference.py
     """
     # 将测试限制在固定卡上
-    os.environ["CUDA_VISIBLE_DEVICES"] = "4"
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 
     experiment_config = {
