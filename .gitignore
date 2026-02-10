@@ -30,3 +30,5 @@ desktop.ini
 !/checkpoints/*.yaml
 /outputs/
 /.gradio
+/unitaf_ckpt
+*.pt

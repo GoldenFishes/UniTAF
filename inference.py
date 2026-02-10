@@ -73,8 +73,9 @@ class IndexTTSExperiment:
         # 定义说话人音频数据
         self.spk_audio_data = {
             # "mabaoguo": "examples/voice_mabaoguo.wav",
-            "furina": "examples/voice_furina.wav",
-            "zhongli": "examples/voice_zhongli.wav",
+            # "furina": "examples/voice_furina.wav",
+            # "zhongli": "examples/voice_zhongli.wav",
+            "qxsk_fengchen": "examples/voice_qxsk_fengchen.wav",
         }
 
         # 定义带有不同情感色彩的文本数据
@@ -82,12 +83,12 @@ class IndexTTSExperiment:
             "平静,温和": "清晨的阳光透过窗帘洒在书桌上，新的一天开始了。窗外鸟儿欢快地歌唱，空气中弥漫着淡淡的花香。",
             # "喜悦,兴奋": "突然，电话铃声响起！是我期待已久的好消息——我获得了梦寐以求的工作机会！这真是太棒了！我忍不住在房间里跳起舞来，心中充满了无限的喜悦和期待！",
             # "焦虑,紧张": "然而，兴奋过后，一丝不安涌上心头。我真的能胜任这份工作吗？面对新的环境和挑战，我感到有些忐忑。手心开始冒汗，心跳也不由自主地加快了。",
-            # "悲伤,低落": "就在这时，窗外下起了雨。雨滴敲打着窗户，仿佛在诉说着我的忧虑。我想起了去年这个时候，也是在这样的雨天，我失去了最亲爱的外婆... 泪水模糊了双眼。",
-            # "愤怒,激动": "不！我不能这样消沉下去！为什么每次遇到困难就要退缩？我受够了这种懦弱的自己！我要振作起来，证明给所有人看！",
-            # "坚定,充满希望": "雨停了，彩虹出现在天边。我深吸一口气，告诉自己：人生就像这四季更替，有晴有雨，有起有落。我要勇敢地迎接每一个挑战！",
-            # "温柔,感恩": "感谢那些曾经帮助过我的人，感谢生活中的每一次经历。无论是快乐还是痛苦，都让我成为了更好的自己。",
-            # "幽默,轻松": "说起来，人生就像坐过山车——有时候你会尖叫，有时候你会大笑，但最重要的是，你要享受整个过程！",
-            # "平和,睿智": "夜幕降临，星光点点。我静静地坐在窗前，心中充满了平静。明天，将是全新的一天，带着希望和勇气继续前行。"
+            "悲伤,低落": "就在这时，窗外下起了雨。雨滴敲打着窗户，仿佛在诉说着我的忧虑。我想起了去年这个时候，也是在这样的雨天，我失去了最亲爱的外婆... 泪水模糊了双眼。",
+            "愤怒,激动": "不！我不能这样消沉下去！为什么每次遇到困难就要退缩？我受够了这种懦弱的自己！我要振作起来，证明给所有人看！",
+            "坚定,充满希望": "雨停了，彩虹出现在天边。我深吸一口气，告诉自己：人生就像这四季更替，有晴有雨，有起有落。我要勇敢地迎接每一个挑战！",
+            "温柔,感恩": "感谢那些曾经帮助过我的人，感谢生活中的每一次经历。无论是快乐还是痛苦，都让我成为了更好的自己。",
+            "幽默,轻松": "说起来，人生就像坐过山车——有时候你会尖叫，有时候你会大笑，但最重要的是，你要享受整个过程！",
+            "平和,睿智": "夜幕降临，星光点点。我静静地坐在窗前，心中充满了平静。明天，将是全新的一天，带着希望和勇气继续前行。"
         }
 
         # 专门用于不同情感控制测试的中性文本
@@ -793,7 +794,7 @@ if __name__ == "__main__":
     )
 
     # 实验1: 无情感控制
-    # experiment.experiment1_no_emotion_control()
+    experiment.experiment1_no_emotion_control()
 
     # 实验2: 自我推断情感
     # experiment.experiment2_self_inferred_emotion()
@@ -814,17 +815,17 @@ if __name__ == "__main__":
     # experiment.compare_tts_audio_and_GT_audio()
 
 
-    # 不使用批量实验，单独测试
-    text = "清晨的阳光透过窗帘洒在书桌上，新的一天开始了。窗外鸟儿欢快地歌唱，空气中弥漫着淡淡的花香。"
-    experiment.tts.infer(
-        spk_audio_prompt='examples/voice_zhongli.wav',
-        text=text,
-        output_path="outputs/IndexTTS2_output.wav",
-        emo_alpha=0.6,
-        use_emo_text=True,
-        emo_text=text,  # 情感控制选择从传入的情感文本中推断，不传额外用于推断的情感文本时则直接从目标文本中推断。
-        verbose=False
-    )
+    # # 不使用批量实验，单独测试
+    # text = "清晨的阳光透过窗帘洒在书桌上，新的一天开始了。窗外鸟儿欢快地歌唱，空气中弥漫着淡淡的花香。"
+    # experiment.tts.infer(
+    #     spk_audio_prompt='examples/voice_zhongli.wav',
+    #     text=text,
+    #     output_path="outputs/IndexTTS2_output.wav",
+    #     emo_alpha=0.6,
+    #     use_emo_text=True,
+    #     emo_text=text,  # 情感控制选择从传入的情感文本中推断，不传额外用于推断的情感文本时则直接从目标文本中推断。
+    #     verbose=False
+    # )
     # text = "快躲起来！是他要来了！他要来抓我们了！"
     # experiment.tts.infer(
     #     spk_audio_prompt='examples/voice_12.wav',

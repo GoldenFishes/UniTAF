@@ -118,7 +118,7 @@ if __name__ == "__main__":
     测试联合模型的流式推理 python -m unitaf_utils.test_stream_UniTAF
     '''
     # 限制可见cuda
-    os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+    os.environ["CUDA_VISIBLE_DEVICES"] = "7"
 
     current_dir = os.path.dirname(os.path.abspath(__file__))
     project_root = os.path.dirname(current_dir)

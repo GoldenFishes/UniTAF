@@ -127,7 +127,7 @@ class UniTAFExperiment:
 
         for task_dir in task_dirs:
             # 限制进行的任务：
-            if task_dir.name in ["mixed-lingual_in-context_prompt", "emotion_prompt"]:  # "hardcase_prompt", "mixed-lingual_in-context_prompt", "emotion_prompt"
+            if task_dir.name in ["hardcase_prompt", "emotion_prompt"]:  # "hardcase_prompt", "mixed-lingual_in-context_prompt", "emotion_prompt"
                 print(f"\n--------- start task: {task_dir.name} ---------")
                 # TASK_NAME
                 task_name = task_dir.name.replace("_prompt", "")
@@ -192,17 +192,21 @@ if __name__ == '__main__':
             #     "audio_feature_projector": "./unitaf_ckpt/UniTAF-A2F(顶点空间loss,40epoch验证收敛)-加载Adapter预训练权重(约束AudioFeature_step_74140)_251231/checkpoint-80000/audio_feature_projector.pt",
             #     "a2f_model": "./unitaf_ckpt/UniTAF-A2F(顶点空间loss,40epoch验证收敛)-加载Adapter预训练权重(约束AudioFeature_step_74140)_251231/checkpoint-80000/a2f_model.pt",
             # },
-            "vertex_mouth": {
-                "audio_feature_projector": "./unitaf_ckpt/UniTAF-A2F(口型状态顶点空间加权loss)-加载Adapter预训练权重(约束AudioFeature_step_74140)_260104/checkpoint-74140/audio_feature_projector.pt",
-                "a2f_model": "./unitaf_ckpt/UniTAF-A2F(口型状态顶点空间加权loss)-加载Adapter预训练权重(约束AudioFeature_step_74140)_260104/checkpoint-74140/a2f_model.pt",
-            },
+            # "vertex_mouth": {
+            #     "audio_feature_projector": "./unitaf_ckpt/UniTAF-A2F(口型状态顶点空间加权loss)-加载Adapter预训练权重(约束AudioFeature_step_74140)_260104/checkpoint-74140/audio_feature_projector.pt",
+            #     "a2f_model": "./unitaf_ckpt/UniTAF-A2F(口型状态顶点空间加权loss)-加载Adapter预训练权重(约束AudioFeature_step_74140)_260104/checkpoint-74140/a2f_model.pt",
+            # },
             # "coeff+vertex": {
             #     "audio_feature_projector": "./unitaf_ckpt/UniTAF-A2F(系数空间loss+顶点空间loss)-加载Adapter预训练权重(约束AudioFeature_step_74140)_251231/checkpoint-74140/audio_feature_projector.pt",
             #     "a2f_model": "./unitaf_ckpt/UniTAF-A2F(系数空间loss+顶点空间loss)-加载Adapter预训练权重(约束AudioFeature_step_74140)_251231/checkpoint-74140/a2f_model.pt",
             # },
-            "coeff+vertex_mouth": {
-                "audio_feature_projector": "./unitaf_ckpt/UniTAF-A2F(系数空间loss+口型状态顶点空间加权loss)-加载Adapter预训练权重(约束AudioFeature_step_74140)_251231/checkpoint-74140/audio_feature_projector.pt",
-                "a2f_model": "./unitaf_ckpt/UniTAF-A2F(系数空间loss+口型状态顶点空间加权loss)-加载Adapter预训练权重(约束AudioFeature_step_74140)_251231/checkpoint-74140/a2f_model.pt",
+            # "coeff+vertex_mouth": {
+            #     "audio_feature_projector": "./unitaf_ckpt/UniTAF-A2F(系数空间loss+口型状态顶点空间加权loss)-加载Adapter预训练权重(约束AudioFeature_step_74140)_251231/checkpoint-74140/audio_feature_projector.pt",
+            #     "a2f_model": "./unitaf_ckpt/UniTAF-A2F(系数空间loss+口型状态顶点空间加权loss)-加载Adapter预训练权重(约束AudioFeature_step_74140)_251231/checkpoint-74140/a2f_model.pt",
+            # },
+            "vertex_mouth_apply2mouth": {
+                "audio_feature_projector": "./unitaf_ckpt/UniTAF-A2F(口型状态顶点空间加权loss_加权仅作用于嘴部顶点)-加载Adapter预训练权重(约束AudioFeature_step_74140)_260109/checkpoint-74140/audio_feature_projector.pt",
+                "a2f_model": "./unitaf_ckpt/UniTAF-A2F(口型状态顶点空间加权loss_加权仅作用于嘴部顶点)-加载Adapter预训练权重(约束AudioFeature_step_74140)_260109/checkpoint-74140/a2f_model.pt",
             },
         },
         "eval_dataset_path": "/home/zqg/project/data/TTS-Eval Dataset",
