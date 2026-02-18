@@ -2,7 +2,7 @@
 
 本项目技术报告：https://arxiv.org/abs/2602.15651
 
-.
+（本项目在[IndexTTS2](https://github.com/index-tts/index-tts)与[UniTalker](https://github.com/X-niper/UniTalker)基础上构建）
 
 ### TODO:
 
@@ -11,8 +11,6 @@
 .
 
 ## 1. Install
-
-.
 
 以下三种安装方式任选其一
 
@@ -708,5 +706,4 @@ UniTAF/
 ## 4. License
 
 本项目在[IndexTTS2](https://github.com/index-tts/index-tts)与[UniTalker](https://github.com/X-niper/UniTalker)基础上构建，本项目作学术用途，本项目开源协议将遵守且沿用IndexTTS2与UniTalker的开源协议。
-
 
